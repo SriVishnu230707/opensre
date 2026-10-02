@@ -465,7 +465,9 @@ function Invoke-OpenSreWithRetry {
         catch {
             $statusCode = Get-OpenSreHttpStatusCodeFromError -ErrorRecord $_
             if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500) {
-                if ($Description -eq "fetch release metadata from GitHub" -and ($statusCode -eq 403 -or $statusCode -eq 429)) {
+                if ($Description -eq "fetch release metadata from GitHub" -and
+                    ($statusCode -eq [int][System.Net.HttpStatusCode]::Forbidden -or
+                     $statusCode -eq [int][System.Net.HttpStatusCode]::TooManyRequests)) {
                     throw "GitHub release API returned HTTP $statusCode. The API may be rate-limited; retry later or set GH_TOKEN (or GITHUB_TOKEN) to a GitHub token. $($_.Exception.Message)"
                 }
                 throw "Failed to $Description. $($_.Exception.Message)"
@@ -559,7 +561,20 @@ function Invoke-OpenSreRestMethod {
     }
 
     return Invoke-OpenSreWithRetry -Description "fetch release metadata from GitHub" -Operation {
-        Invoke-RestMethod @params
+        try {
+            Invoke-RestMethod @params
+        }
+        catch {
+            $statusCode = Get-OpenSreHttpStatusCodeFromError -ErrorRecord $_
+            if ($statusCode -ne [int][System.Net.HttpStatusCode]::Unauthorized -or
+                -not $params.Headers.ContainsKey("Authorization")) {
+                throw
+            }
+
+            # A stale inherited token must not break public release installs.
+            $params.Headers.Remove("Authorization")
+            Invoke-RestMethod @params
+        }
     }
 }
 
