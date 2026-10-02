@@ -64,6 +64,75 @@ def test_install_ps1_preserves_retry_contract_source() -> None:
     assert "$statusCode -ge 400 -and $statusCode -lt 500" in source
 
 
+def test_install_ps1_api_token_is_not_sent_to_asset_downloads() -> None:
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("PowerShell is not installed in this environment.")
+
+    script = textwrap.dedent(
+        f"""
+        . '{INSTALL_PS1}' -SkipMain
+        $env:GH_TOKEN = 'test-token'
+        $env:GITHUB_TOKEN = 'other-token'
+        $api = Get-OpenSreApiRequestHeaders
+        $asset = Get-OpenSreRequestHeaders
+        if ($api.Authorization -ne 'Bearer test-token') {{ throw 'API token missing' }}
+        if ($asset.ContainsKey('Authorization')) {{ throw 'Token leaked to asset request' }}
+        $env:GH_TOKEN = ''
+        if ((Get-OpenSreApiRequestHeaders).Authorization -ne 'Bearer other-token') {{ throw 'GITHUB_TOKEN fallback missing' }}
+        Write-Output 'HEADERS_OK'
+        """
+    )
+    result = subprocess.run(
+        [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HEADERS_OK" in result.stdout
+
+
+@pytest.mark.parametrize("status", [403, 429])
+def test_install_ps1_rate_limit_error_is_actionable(status: int) -> None:
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("PowerShell is not installed in this environment.")
+
+    script = textwrap.dedent(
+        f"""
+        . '{INSTALL_PS1}' -SkipMain
+        $script:attempts = 0
+        try {{
+            Invoke-OpenSreWithRetry -Description 'fetch release metadata from GitHub' -Operation {{
+                $script:attempts++
+                $failure = New-Object System.Exception 'rate limited'
+                $failure | Add-Member -NotePropertyName StatusCode -NotePropertyValue {status}
+                throw $failure
+            }} | Out-Null
+            throw 'Expected rate-limit failure'
+        }}
+        catch {{
+            if ($_.Exception.Message -notmatch 'HTTP {status}.*GH_TOKEN') {{ throw }}
+            if ($script:attempts -ne 1) {{ throw 'Rate limit was retried' }}
+        }}
+        Write-Output 'RATE_LIMIT_OK'
+        """
+    )
+    result = subprocess.run(
+        [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "RATE_LIMIT_OK" in result.stdout
+
+
 def test_install_ps1_defaults_to_main_build_channel() -> None:
     source = INSTALL_PS1.read_text()
 
