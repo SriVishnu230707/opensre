@@ -546,7 +546,7 @@ function Invoke-OpenSreRestMethod {
 
     $params = @{
         Uri = $Uri
-                        Headers = Get-OpenSreApiRequestHeaders
+        Headers = Get-OpenSreApiRequestHeaders
     }
 
     $command = Get-Command Invoke-RestMethod -ErrorAction Stop
