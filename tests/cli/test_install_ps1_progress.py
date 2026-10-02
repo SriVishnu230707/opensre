@@ -185,6 +185,51 @@ def test_install_ps1_invalid_token_retries_release_metadata_anonymously() -> Non
     assert "ANONYMOUS_FALLBACK_OK" in result.stdout
 
 
+def test_install_ps1_rate_limited_after_rejected_token_recommends_replacement() -> None:
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("PowerShell is not installed in this environment.")
+
+    script = textwrap.dedent(
+        f"""
+        . '{INSTALL_PS1}' -SkipMain
+        $env:GH_TOKEN = 'expired-token'
+        $script:attempts = 0
+        function Invoke-RestMethod {{
+            param($Uri, $Headers)
+            $script:attempts++
+            $status = if ($Headers.ContainsKey('Authorization')) {{
+                [System.Net.HttpStatusCode]::Unauthorized
+            }} else {{
+                [System.Net.HttpStatusCode]::Forbidden
+            }}
+            $failure = New-Object System.Exception 'request denied'
+            $failure | Add-Member -NotePropertyName StatusCode -NotePropertyValue ([int]$status)
+            throw $failure
+        }}
+        try {{
+            Invoke-OpenSreRestMethod -Uri 'https://api.github.com/example' | Out-Null
+            throw 'Expected rate-limit failure'
+        }}
+        catch {{
+            if ($_.Exception.Message -notmatch 'Replace any rejected token') {{ throw }}
+            if ($script:attempts -ne 2) {{ throw 'Unexpected retry count' }}
+        }}
+        Write-Output 'REJECTED_TOKEN_GUIDANCE_OK'
+        """
+    )
+    result = subprocess.run(
+        [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "REJECTED_TOKEN_GUIDANCE_OK" in result.stdout
+
+
 def test_install_ps1_defaults_to_main_build_channel() -> None:
     source = INSTALL_PS1.read_text()
 
