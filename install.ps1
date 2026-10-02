@@ -465,10 +465,10 @@ function Invoke-OpenSreWithRetry {
         catch {
             $statusCode = Get-OpenSreHttpStatusCodeFromError -ErrorRecord $_
             if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500) {
-                                if ($Description -eq "fetch release metadata from GitHub" -and ($statusCode -eq 403 -or $statusCode -eq 429)) {
+                if ($Description -eq "fetch release metadata from GitHub" -and ($statusCode -eq 403 -or $statusCode -eq 429)) {
                     throw "GitHub release API returned HTTP $statusCode. The API may be rate-limited; retry later or set GH_TOKEN (or GITHUB_TOKEN) to a GitHub token. $($_.Exception.Message)"
                 }
-throw "Failed to $Description. $($_.Exception.Message)"
+                throw "Failed to $Description. $($_.Exception.Message)"
             }
 
             if ($attempt -ge $MaxAttempts) {
@@ -546,7 +546,7 @@ function Invoke-OpenSreRestMethod {
 
     $params = @{
         Uri = $Uri
-                Headers = Get-OpenSreApiRequestHeaders
+                        Headers = Get-OpenSreApiRequestHeaders
     }
 
     $command = Get-Command Invoke-RestMethod -ErrorAction Stop
