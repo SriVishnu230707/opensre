@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import textwrap
+from http import HTTPStatus
 from pathlib import Path
 
 import pytest
@@ -78,6 +79,19 @@ def test_install_ps1_api_token_is_not_sent_to_asset_downloads() -> None:
         $asset = Get-OpenSreRequestHeaders
         if ($api.Authorization -ne 'Bearer test-token') {{ throw 'API token missing' }}
         if ($asset.ContainsKey('Authorization')) {{ throw 'Token leaked to asset request' }}
+        function Invoke-RestMethod {{
+            param($Uri, $Headers)
+            $script:metadataHeaders = $Headers
+            return @{{ tag_name = 'v1' }}
+        }}
+        function Invoke-WebRequest {{
+            param($Uri, $Headers, $OutFile)
+            $script:assetHeaders = $Headers
+        }}
+        Invoke-OpenSreRestMethod -Uri 'https://api.github.com/example' | Out-Null
+        Invoke-OpenSreDownloadFileWithProgress -Uri 'https://github.com/example.zip' -OutFile 'unused.zip'
+        if ($script:metadataHeaders.Authorization -ne 'Bearer test-token') {{ throw 'Metadata request missing token' }}
+        if ($script:assetHeaders.ContainsKey('Authorization')) {{ throw 'Asset request leaked token' }}
         $env:GH_TOKEN = ''
         if ((Get-OpenSreApiRequestHeaders).Authorization -ne 'Bearer other-token') {{ throw 'GITHUB_TOKEN fallback missing' }}
         Write-Output 'HEADERS_OK'
@@ -95,8 +109,8 @@ def test_install_ps1_api_token_is_not_sent_to_asset_downloads() -> None:
     assert "HEADERS_OK" in result.stdout
 
 
-@pytest.mark.parametrize("status", [403, 429])
-def test_install_ps1_rate_limit_error_is_actionable(status: int) -> None:
+@pytest.mark.parametrize("status", [HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS])
+def test_install_ps1_rate_limit_error_is_actionable(status: HTTPStatus) -> None:
     shell = _powershell()
     if shell is None:
         pytest.skip("PowerShell is not installed in this environment.")
@@ -109,13 +123,13 @@ def test_install_ps1_rate_limit_error_is_actionable(status: int) -> None:
             Invoke-OpenSreWithRetry -Description 'fetch release metadata from GitHub' -Operation {{
                 $script:attempts++
                 $failure = New-Object System.Exception 'rate limited'
-                $failure | Add-Member -NotePropertyName StatusCode -NotePropertyValue {status}
+                $failure | Add-Member -NotePropertyName StatusCode -NotePropertyValue {status.value}
                 throw $failure
             }} | Out-Null
             throw 'Expected rate-limit failure'
         }}
         catch {{
-            if ($_.Exception.Message -notmatch 'HTTP {status}.*GH_TOKEN') {{ throw }}
+            if ($_.Exception.Message -notmatch 'HTTP {status.value}.*GH_TOKEN') {{ throw }}
             if ($script:attempts -ne 1) {{ throw 'Rate limit was retried' }}
         }}
         Write-Output 'RATE_LIMIT_OK'
@@ -131,6 +145,44 @@ def test_install_ps1_rate_limit_error_is_actionable(status: int) -> None:
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "RATE_LIMIT_OK" in result.stdout
+
+
+def test_install_ps1_invalid_token_retries_release_metadata_anonymously() -> None:
+    shell = _powershell()
+    if shell is None:
+        pytest.skip("PowerShell is not installed in this environment.")
+
+    script = textwrap.dedent(
+        f"""
+        . '{INSTALL_PS1}' -SkipMain
+        $env:GH_TOKEN = 'expired-token'
+        $script:attempts = 0
+        function Invoke-RestMethod {{
+            param($Uri, $Headers)
+            $script:attempts++
+            if ($Headers.ContainsKey('Authorization')) {{
+                $failure = New-Object System.Exception 'invalid token'
+                $failure | Add-Member -NotePropertyName StatusCode -NotePropertyValue ([int][System.Net.HttpStatusCode]::Unauthorized)
+                throw $failure
+            }}
+            return @{{ tag_name = 'v1' }}
+        }}
+        $release = Invoke-OpenSreRestMethod -Uri 'https://api.github.com/example'
+        if ($release.tag_name -ne 'v1') {{ throw 'Anonymous fallback failed' }}
+        if ($script:attempts -ne 2) {{ throw 'Expected one token request and one anonymous request' }}
+        Write-Output 'ANONYMOUS_FALLBACK_OK'
+        """
+    )
+    result = subprocess.run(
+        [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ANONYMOUS_FALLBACK_OK" in result.stdout
 
 
 def test_install_ps1_defaults_to_main_build_channel() -> None:
