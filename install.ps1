@@ -468,7 +468,7 @@ function Invoke-OpenSreWithRetry {
                 if ($Description -eq "fetch release metadata from GitHub" -and
                     ($statusCode -eq [int][System.Net.HttpStatusCode]::Forbidden -or
                      $statusCode -eq [int][System.Net.HttpStatusCode]::TooManyRequests)) {
-                    throw "GitHub release API returned HTTP $statusCode. The API may be rate-limited; retry later or set GH_TOKEN (or GITHUB_TOKEN) to a GitHub token. $($_.Exception.Message)"
+                    throw "GitHub release API returned HTTP $statusCode. The API may be rate-limited; retry later or set GH_TOKEN (or GITHUB_TOKEN) to a valid GitHub token. Replace any rejected token. $($_.Exception.Message)"
                 }
                 throw "Failed to $Description. $($_.Exception.Message)"
             }
