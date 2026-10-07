@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 
@@ -24,6 +25,13 @@ def _fetch_webapp_vault() -> list[dict[str, Any]] | None:
     return webapp_vault.fetch_webapp_org_integrations()
 
 
+def _fleet_vault_configured() -> bool:
+    """Whether this process is a silo with a fleet vault, not a signed-in laptop."""
+    import integrations.webapp_vault as webapp_vault
+
+    return webapp_vault.webapp_vault_configured()
+
+
 def _fetch_account_integrations() -> list[dict[str, Any]]:
     """The signed-in account's org integrations; the client imports on first use."""
     import integrations.account_integrations as account_integrations
@@ -35,6 +43,23 @@ def _account_integrations_generation() -> int:
     import integrations.account_integrations as account_integrations
 
     return account_integrations.account_integrations_generation()
+
+
+def _github_rest_token_resolves(resolved_integrations: Mapping[str, Any]) -> bool:
+    """The analyzer's own token predicate; the GitHub client imports on first use."""
+    from integrations.github import has_github_rest_token
+
+    return has_github_rest_token(resolved_integrations)
+
+
+def _slack_connection_resolves(resolved_integrations: Mapping[str, Any]) -> bool:
+    """Slack resolves with a bot token or a webhook, as the Slack tools read it."""
+    from core.tool import availability_view
+
+    slack = availability_view(dict(resolved_integrations)).get("slack")
+    if not isinstance(slack, Mapping):
+        return False
+    return any(str(slack.get(field) or "").strip() for field in ("bot_token", "webhook_url"))
 
 
 def register_harness_adapters() -> None:
@@ -60,6 +85,7 @@ def register_harness_adapters() -> None:
         configured_services=lambda: tuple(configured_integration_services()),
         setupable_services=_setupable_services,
         fetch_webapp_vault=_fetch_webapp_vault,
+        fleet_vault_configured=_fleet_vault_configured,
         fetch_account_integrations=_fetch_account_integrations,
         account_integrations_generation=_account_integrations_generation,
     ).install()
@@ -76,6 +102,23 @@ def register_harness_adapters() -> None:
     _register_secondary_tool_sources()
     _register_gateway_persona()
     _register_preferred_evidence_sources()
+    _register_skill_prerequisite_checks()
+
+
+def _register_skill_prerequisite_checks() -> None:
+    """Answer the skill prerequisite checks the host gate looks up by id."""
+    from config.constants.skill_prerequisites import (
+        GITHUB_REST_TOKEN_CHECK,
+        SLACK_CONNECTED_CHECK,
+    )
+    from infrastructure.harness_providers import (
+        clear_skill_prerequisite_checks,
+        register_skill_prerequisite_check,
+    )
+
+    clear_skill_prerequisite_checks()
+    register_skill_prerequisite_check(GITHUB_REST_TOKEN_CHECK, _github_rest_token_resolves)
+    register_skill_prerequisite_check(SLACK_CONNECTED_CHECK, _slack_connection_resolves)
 
 
 def _register_vcs_repo_scope_providers() -> None:

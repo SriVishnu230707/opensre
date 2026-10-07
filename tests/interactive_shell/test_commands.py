@@ -14,6 +14,15 @@ import pytest
 from prompt_toolkit.history import FileHistory
 from rich.console import Console
 
+from config.account import AccountLLMRoute
+from config.constants.conversation_history import (
+    HISTORY_COMPACT_AFTER_TURNS,
+    HISTORY_KEEP_MAX_TURNS,
+    OPENSRE_HISTORY_TOKEN_BUDGET_ENV,
+    OPENSRE_LLM_COMPACTION_ENV,
+    OPENSRE_STRUCTURED_HISTORY_ENV,
+)
+from config.constants.runtime_metadata import OPENSRE_WORKSPACE_REPO_ENV
 from surfaces.interactive_shell.command_registry import SLASH_COMMANDS, dispatch_slash
 from surfaces.interactive_shell.command_registry import repl_data as repl_data_module
 from surfaces.interactive_shell.command_registry.tasks_cmds import _validate_cancel_args
@@ -26,10 +35,22 @@ def _capture() -> tuple[Console, io.StringIO]:
     return Console(file=buf, force_terminal=False, highlight=False), buf
 
 
+def _signed_out() -> None:
+    return None
+
+
+def _signed_in() -> AccountLLMRoute:
+    return AccountLLMRoute(base_url="https://app.opensre.test/api/llm", model="gpt-5.4-mini")
+
+
+def _menu_must_not_open(**_kwargs: object) -> str:
+    raise AssertionError("an account-managed shell must refuse before opening a menu")
+
+
 class TestDispatchSlash:
     def test_exit_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
-            "surfaces.interactive_shell.command_registry.system._flush_analytics_on_exit",
+            "surfaces.interactive_shell.runtime.exit_control._flush_analytics_on_exit",
             lambda _console: None,
         )
         session = Session()
@@ -44,7 +65,7 @@ class TestDispatchSlash:
             calls.append("flush")
 
         monkeypatch.setattr(
-            "surfaces.interactive_shell.command_registry.system._flush_analytics_on_exit",
+            "surfaces.interactive_shell.runtime.exit_control._flush_analytics_on_exit",
             _flush,
         )
         session = Session()
@@ -203,6 +224,31 @@ class TestDispatchSlash:
         assert picker_called == [True]
         assert buf.getvalue() == ""
 
+    @pytest.mark.parametrize(
+        ("selected", "expected"),
+        [
+            ("/integrations", "/integrations list"),
+            ("/mcp", "/mcp list"),
+        ],
+    )
+    def test_tty_help_runs_explicit_connection_list_command(
+        self, monkeypatch: pytest.MonkeyPatch, selected: str, expected: str
+    ) -> None:
+        import surfaces.interactive_shell.command_registry as command_registry
+        from surfaces.interactive_shell.command_registry import help as help_cmd
+
+        dispatched: list[str] = []
+        monkeypatch.setattr(help_cmd, "repl_tty_interactive", lambda: True)
+        monkeypatch.setattr(help_cmd, "choose_help_command", lambda _sections: selected)
+        monkeypatch.setattr(
+            command_registry,
+            "dispatch_slash",
+            lambda command, _session, _console: dispatched.append(command) or True,
+        )
+
+        assert dispatch_slash("/help", Session(), _capture()[0]) is True
+        assert dispatched == [expected]
+
     def test_bare_slash_previews_all_commands(self) -> None:
         session = Session()
         console, buf = _capture()
@@ -303,8 +349,6 @@ class TestDispatchSlash:
         assert "interactions" in output
         assert "reasoning effort" in output
         assert "trust mode" in output
-        assert "grounding cli cache" in output
-        assert "grounding docs cache" in output
 
     def test_unknown_command_does_not_exit(self) -> None:
         session = Session()
@@ -356,7 +400,7 @@ class TestDispatchSlash:
 
 
 class TestSpecificListCommands:
-    """Coverage for /integrations list, /mcp list, /model show, and /tools list."""
+    """Coverage for /integrations list, /mcp list, /model show, and /tools."""
 
     _FAKE_INTEGRATIONS = [
         {"service": "datadog", "source": "store", "status": "ok", "detail": "API ok"},
@@ -485,7 +529,7 @@ class TestSpecificListCommands:
         )
 
         console, buf = _capture()
-        dispatch_slash("/tools list", Session(), console)
+        dispatch_slash("/tools", Session(), console)
         output = buf.getvalue()
         assert "search_github" in output
         assert "chat" in output
@@ -519,11 +563,12 @@ class TestIntegrationsCommand:
         assert "datadog" in output
         assert "github" in output
 
-    def test_list_is_default_when_no_subcommand(self, monkeypatch: object) -> None:
+    def test_bare_command_shows_list_usage(self, monkeypatch: object) -> None:
         self._patch(monkeypatch)
         console, buf = _capture()
         dispatch_slash("/integrations", Session(), console)
-        assert "datadog" in buf.getvalue()
+        assert "usage:" in buf.getvalue()
+        assert "/integrations list" in buf.getvalue()
 
     def test_verify_reports_issues(self, monkeypatch: object) -> None:
         self._patch(monkeypatch)
@@ -722,11 +767,12 @@ class TestMcpCommand:
         dispatch_slash("/mcp list", Session(), console)
         assert "github" in buf.getvalue()
 
-    def test_list_is_default_when_no_subcommand(self, monkeypatch: object) -> None:
+    def test_bare_command_shows_list_usage(self, monkeypatch: object) -> None:
         self._patch(monkeypatch)
         console, buf = _capture()
         dispatch_slash("/mcp", Session(), console)
-        assert "github" in buf.getvalue()
+        assert "usage:" in buf.getvalue()
+        assert "/mcp list" in buf.getvalue()
 
     def test_connect_delegates_to_cli(self, monkeypatch: object) -> None:
         from surfaces.interactive_shell.command_registry import integrations as m
@@ -959,10 +1005,65 @@ class TestModelCommand:
 
         assert os.environ.get("LLM_PROVIDER") == "gemini"
 
-    def test_set_missing_provider_prints_usage(self) -> None:
+    def test_set_without_provider_lists_valid_providers_when_not_interactive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Agent ``slash_invoke`` (no exclusive stdin) gets the ids to retry with."""
+        monkeypatch.setattr("config.account.account_llm_route", _signed_out)
         console, buf = _capture()
-        dispatch_slash("/model set", Session(), console)
-        assert "usage" in buf.getvalue()
+        session = Session()
+
+        dispatch_slash("/model set", session, console)
+
+        output = buf.getvalue()
+        assert "usage: /model set <provider> [model] [--toolcall-model <model>]" in output
+        assert "valid providers:" in output
+        assert "custom-openai" in output
+        assert session.history[-1]["ok"] is False
+
+    def test_set_without_provider_opens_the_provider_picker_when_typed(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        self._patch_llm(monkeypatch)
+        import surfaces.shared.llm_setup.env_sync as env_sync
+        from surfaces.interactive_shell.command_registry.model import command as model_cmd
+
+        env_path = tmp_path / ".env"
+        self._redirect_wizard_store(monkeypatch, tmp_path)
+        monkeypatch.setattr(env_sync, "PROJECT_ENV_PATH", env_path)
+        monkeypatch.setattr("config.env_file.PROJECT_ENV_PATH", env_path)
+        monkeypatch.setattr("config.account.account_llm_route", _signed_out)
+        monkeypatch.setattr(model_cmd, "repl_tty_interactive", lambda: True)
+        selections = iter([model_cmd.OTHER_PROVIDER_SELECTION, "anthropic", "__provider_default__"])
+        monkeypatch.setattr(model_cmd, "repl_choose_one", lambda **_: next(selections))
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        console, buf = _capture()
+        session = Session()
+        session.terminal.exclusive_stdin_active = True
+
+        dispatch_slash("/model set", session, console)
+
+        assert "switched LLM provider" in buf.getvalue()
+        assert "LLM_PROVIDER=anthropic" in env_path.read_text(encoding="utf-8")
+
+    def test_set_without_provider_refuses_before_the_picker_when_account_managed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from surfaces.interactive_shell.command_registry.model import command as model_cmd
+
+        monkeypatch.setattr("config.account.account_llm_route", _signed_in)
+        monkeypatch.setattr(model_cmd, "repl_tty_interactive", lambda: True)
+        monkeypatch.setattr(model_cmd, "repl_choose_one", _menu_must_not_open)
+        console, buf = _capture()
+        session = Session()
+        session.terminal.exclusive_stdin_active = True
+
+        dispatch_slash("/model set", session, console)
+
+        assert "LLM settings are managed by your OpenSRE account" in buf.getvalue()
+        assert session.history[-1]["ok"] is False
 
     def test_set_unknown_reasoning_model_is_rejected(
         self,
@@ -1767,19 +1868,61 @@ class TestHistoryCommand:
 
 
 class TestContextCommand:
-    def test_empty_context_says_so(self) -> None:
-        console, buf = _capture()
-        dispatch_slash("/context", Session(), console)
-        assert "no infra context" in buf.getvalue()
-
-    def test_shows_accumulated_keys(self) -> None:
+    def test_lists_each_prompt_block_the_history_and_the_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(OPENSRE_HISTORY_TOKEN_BUDGET_ENV, "8000")
         session = Session()
-        session.accumulated_context = {"service": "orders-api", "region": "us-east-1"}
+        session.agent.record_turn("is ci green?", "CI is green on main.")
         console, buf = _capture()
         dispatch_slash("/context", session, console)
         output = buf.getvalue()
-        assert "orders-api" in output
-        assert "us-east-1" in output
+        assert "action-agent-system-base" in output
+        assert "2 messages from 1 turn" in output
+        assert f"at 8,000 tokens or {HISTORY_COMPACT_AFTER_TURNS} turns" in output
+
+    def test_says_when_the_next_turn_compacts_first(self) -> None:
+        # Many short turns stay under the token budget; compaction's own
+        # verdict, not a token comparison, decides what the next call holds.
+        session = Session()
+        for index in range(HISTORY_COMPACT_AFTER_TURNS + 1):
+            session.agent.record_turn(f"question {index}", f"answer {index}")
+        console, buf = _capture()
+        dispatch_slash("/context", session, console)
+        output = buf.getvalue()
+        assert "older turns are summarized before the next turn" in output
+        # The breakdown is the call the model gets: the turns compaction keeps,
+        # not the transcript it is about to fold away.
+        assert "history after compaction" in output
+        assert f"from {HISTORY_KEEP_MAX_TURNS} turns" in output
+        kept = HISTORY_KEEP_MAX_TURNS * 2
+        assert f"folds {(HISTORY_COMPACT_AFTER_TURNS + 1) * 2 - kept} older messages" in output
+
+    def test_shows_the_repository_the_next_turn_targets(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(OPENSRE_WORKSPACE_REPO_ENV, "Tracer-Cloud/opensre")
+        session = Session()
+        console, buf = _capture()
+        dispatch_slash("/context", session, console)
+        assert "none active yet" in buf.getvalue()
+
+        session.resolved_integrations_cache = {"github": {"connection_verified": True}}
+        console, buf = _capture()
+        dispatch_slash("/context", session, console)
+        output = buf.getvalue()
+        assert "repository-context" in output
+        assert "AGENTS.md" not in output
+        assert "none active yet" not in output
+        assert session.active_vcs_repositories == {}
+
+    def test_leaves_a_pending_recovery_note_for_the_next_turn(self) -> None:
+        session = Session()
+        session.pending_recovery_note = "shell_run started and never finished"
+        console, buf = _capture()
+        dispatch_slash("/context", session, console)
+        assert "interrupted-turn-recovery" in buf.getvalue()
+        assert session.pending_recovery_note == "shell_run started and never finished"
 
 
 class TestCostCommand:
@@ -1848,7 +1991,12 @@ class TestVerboseCommand:
 
 
 class TestCompactCommand:
-    def test_nothing_to_compact_when_small(self) -> None:
+    @pytest.fixture(autouse=True)
+    def _no_model_summary(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(OPENSRE_LLM_COMPACTION_ENV, "0")
+
+    def test_nothing_to_compact_when_small(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(OPENSRE_STRUCTURED_HISTORY_ENV, "0")
         session = Session()
         session.agent.messages = [("user", f"m{i}") for i in range(4)]
         console, buf = _capture()
@@ -1856,7 +2004,10 @@ class TestCompactCommand:
         assert "Nothing to compact yet." in buf.getvalue()
         assert len(session.agent.messages) == 4
 
-    def test_compacts_conversation_branch_when_over_keep_limit(self) -> None:
+    def test_compacts_conversation_branch_when_over_keep_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv(OPENSRE_STRUCTURED_HISTORY_ENV, "0")
         session = Session()
         session.agent.messages = [("user", f"message number {i}") for i in range(20)]
         console, buf = _capture()
@@ -1871,6 +2022,21 @@ class TestCompactCommand:
             entry.get("type") == "slash" and entry.get("text") == "/compact"
             for entry in session.history
         )
+
+    def test_compact_keeps_only_the_newest_turn_with_structured_history(self) -> None:
+        session = Session()
+        session.agent.messages = [
+            message
+            for index in range(5)
+            for message in (("user", f"question {index}"), ("assistant", f"answer {index}"))
+        ]
+        console, buf = _capture()
+
+        dispatch_slash("/compact", session, console)
+
+        assert session.agent.messages[0][1].startswith("Session summary:")
+        assert session.agent.messages[1:] == [("user", "question 4"), ("assistant", "answer 4")]
+        assert "compacted session context" in buf.getvalue()
 
 
 class TestCancelCommand:

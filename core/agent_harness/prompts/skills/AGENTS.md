@@ -182,6 +182,16 @@ menu on skill entry
 `ask_user_choice` executor and reports `queued`, `suppressed`, or
 `unavailable` under the `entry_menu` key of the `skill_view` result.
 
+Before that, a skill that is not yet active passes its host-owned
+prerequisites (`SKILL_PREREQUISITES` in
+`config/constants/skill_prerequisites.py`, checks registered by id in
+`infrastructure/harness_providers/skill_prerequisites.py`). An unmet one
+withholds the body, queues a setup menu (`skill_prerequisite_gate.py`), and
+reports it under the `prerequisite` key; after setup the shell resubmits the
+blocked message. A demo picked in the onboarding menu is checked before the
+menu's own follow-up (the demo-repository question), so setup comes first
+there too. Every getting-started skill has a row, even an empty one.
+
 ## Narrow purpose
 
 The skill has a narrow, concrete purpose.
@@ -210,11 +220,12 @@ contract (`ToolRole`, replacing the old `parallel_safe` flag):
   rather than leave the model to spend a solo turn on each plan write. A
   live run of `scheduling-github-ci-repairs` once spent nine solo
   `update_plan` turns (~90 s) on plan writes alone.
-- `TURN_ENDING` (`ask_user_choice`) hands the turn to the user and must be
-  the **only** call in its response; a response that batches anything with a
-  menu executes nothing and returns the same error for each call. Not even
-  bookkeeping rides with it. Mark plan steps before the menu response, not
-  in it.
+- `TURN_ENDING` (`ask_user_choice`) hands the turn to the user and is the
+  **only** action in its response. Bookkeeping may ride with it and runs
+  first, so the `update_plan` that marks the menu step belongs in the menu's
+  response rather than in a solo turn before it (the host refuses a solo
+  plan advance). A response that batches an action with a menu executes
+  nothing and returns the same error for each call.
 
 Once a call's result ends the turn (a queued menu, a pending approval, a
 host cancel), the calls after it in the batch are skipped with an error
@@ -470,6 +481,7 @@ Current collection:
 | Name | Kind | Where | `tools:` |
 |------|------|-------|----------|
 | `delivering-morning-briefings` | workflow | `skills/` | — |
+| `fixing-github-merge-conflicts` | workflow | `skills/` | — |
 | `fixing-github-security-alerts` | workflow | `skills/` | — |
 | `investigating-incidents-with-runbooks` | workflow | `skills/` | — |
 | `repair-github-ci` | workflow | `skills/` | — |
@@ -479,6 +491,7 @@ Current collection:
 | `scheduling-github-ci-repairs` | workflow (demo B) | `skills/onboarding-github-ci/b-…/` | — |
 | `delegating-github-ci-repairs` | workflow (demo C) | `skills/onboarding-github-ci/c-…/` | — |
 | `connecting-slack` | workflow (demo D) | `skills/onboarding-github-ci/d-…/` | — |
+| `analyzing-local-repositories` | workflow (demo A's no-GitHub fallback) | `skills/` | — |
 | `operating-github-cli` | tool usage | `integrations/github/tools/github_cli/` | `github_cli` |
 | `operating-github-ci-fixer` | tool usage | `integrations/github/tools/ci_fix/` | `fix_github_pr_ci` |
 | `operating-github-security-fixer` | tool usage | `integrations/github/tools/security_fix/` | `fix_github_security_alert` |

@@ -36,6 +36,34 @@ app connection takes precedence over a local one; disconnect it in the web app
 if you want a locally configured credential to apply.
 </Info>
 
+<Note>
+The onboarding demos that read GitHub (**Analyze & improve a repo** and **Run
+continuously on this machine**) need a GitHub token before they start. Any of
+these works: the OpenSRE app's GitHub connection, `opensre integrations setup
+github` on this machine, or `GITHUB_TOKEN`, `GH_TOKEN`, or
+`GITHUB_MCP_AUTH_TOKEN` in the environment. Without one, the shell opens a setup
+menu instead of the demo: connecting GitHub in the OpenSRE app is recommended,
+and setting it up on this machine works too. Once GitHub is connected, the demo
+picks up where it stopped.
+</Note>
+
+### Choose among workspace connections
+
+If your workspace has more than one GitHub connection, list the integrations
+and copy the UUID from the `ID` column for the GitHub row whose `SOURCE` is
+`remote`:
+
+```bash
+opensre integrations list
+opensre --github-connection-id <UUID>
+```
+
+`--github-connection-id` accepts workspace UUIDs, not IDs from `local` rows.
+The choice scopes the current shell and is forwarded with managed cloud
+requests. If a matching connection exists but is unavailable, or several
+connections leave the choice ambiguous, OpenSRE disables GitHub tools instead
+of guessing.
+
 ### Option 1: Interactive CLI (browser sign-in)
 
 ```bash
@@ -150,6 +178,7 @@ Inside the REPL: `/integrations verify github` or `/verify github`. Alias: `gith
 | Symptom | Fix |
 | --- | --- |
 | **Authentication failed** | Check that the token has `repo` scope and is not expired |
+| **Wrong workspace GitHub account** | Run `opensre integrations list`, copy the UUID from the remote GitHub row, then start the shell with `opensre --github-connection-id <UUID>` |
 | **Required tools missing** | Ensure toolsets include `repos` — it provides `get_file_contents`, `list_commits`, etc. |
 | **`github_cli` fails / gh not found** | Install [GitHub CLI](https://cli.github.com/) so `gh` is on `PATH`; confirm token via verify |
 | **Connection refused** | Verify `GITHUB_MCP_URL` is reachable and the MCP server is running |

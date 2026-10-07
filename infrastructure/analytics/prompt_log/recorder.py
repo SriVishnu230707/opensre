@@ -10,14 +10,18 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from config.constants.analytics import LLMCreditErrorReason
 from config.prompt_log import PromptLogConfig
 from config.version import get_opensre_version
+from core.llm.shared.llm_retry import credit_exhaustion_reason
 from core.llm_invoke_errors import LLM_PROVIDER_FAILURE_KINDS, classify_provider_error_kind
+from infrastructure.analytics.event_properties import bounded_error_message
 from infrastructure.analytics.prompt_log.sinks.local_jsonl import (
     append_prompt_log_record,
 )
 from infrastructure.analytics.prompt_log.sinks.posthog_ai import capture_ai_generation
 from infrastructure.analytics.provider import JsonValue
+from infrastructure.analytics.scheduled_task_attribution import current_scheduled_task_id
 from infrastructure.safety.secret_redaction import redact_text
 
 _SUPPORTED_TURN_KINDS = frozenset({"agent", "follow_up", "new_alert", "background_task"})
@@ -39,6 +43,13 @@ _TURN_TO_SESSION_KIND: dict[str, str] = {
     "new_alert": "alert",
     "background_task": "cli_command",
 }
+
+# Error recorded when the agent loop hit a hard stop (iteration cap, stagnation,
+# unverified goal) instead of accepting a final answer.
+_STOPPED_SHORT_KIND = "iteration_limit"
+_STOPPED_SHORT_MESSAGE = "Agent stopped before producing a final answer."
+# Loop-outcome properties the stopped-short error message repeats, in order.
+_STOP_DETAIL_KEYS = ("stop_reason", "goal_review_reason", "last_failed_tool", "last_tool_error")
 
 
 def _latest_slash_outcome(session: Any, *, start: int = 0) -> str | None:
@@ -110,9 +121,13 @@ class PromptRecorder:
         self._history_start = len(history) if isinstance(history, list) else 0
         self._surface = surface
         self._properties: dict[str, JsonValue] = {}
+        # Read at start: a background task's recorder flushes later, outside the tick.
+        if scheduled_task_id := current_scheduled_task_id():
+            self._properties["scheduled_task_id"] = scheduled_task_id
         self._response: str = ""
         self._error_kind: str = ""
         self._error_message: str = ""
+        self._ai_error_reason: LLMCreditErrorReason | None = None
         self._model: str | None = None
         self._provider: str | None = None
         self._latency_ms: int | None = None
@@ -122,6 +137,8 @@ class PromptRecorder:
         self._model_system = ""
         self._model_skill = ""
         self._model_context = ""
+        self._model_blocks: dict[str, JsonValue] = {}
+        self._loop_outcome: dict[str, JsonValue] = {}
         self._start = time.monotonic()
         self._flushed = False
 
@@ -153,6 +170,14 @@ class PromptRecorder:
             context, config=self._config, limit=_CONTEXT_MAX_CHARS
         )
 
+    def set_model_blocks(self, blocks: dict[str, JsonValue]) -> None:
+        """Attach the size of each prompt block, the replayed history, and the tool count.
+
+        Block ids and numbers only, never prompt text, so both sinks receive it
+        whole: no redaction, no cap.
+        """
+        self._model_blocks = dict(blocks)
+
     def set_run(self, run: _RunInfo) -> None:
         """Attach the model and provider-reported usage of the agent run."""
         self._llm_attempted = True
@@ -166,6 +191,51 @@ class PromptRecorder:
     def set_llm_attempted(self, attempted: bool) -> None:
         """Record whether dispatch used a provider or a deterministic tool call."""
         self._llm_attempted = attempted
+
+    def set_loop_outcome(
+        self,
+        *,
+        stop_reason: str,
+        goal_review_reason: str = "",
+        last_failed_tool: str = "",
+        last_tool_error: str = "",
+        blocked_tool_calls: int = 0,
+        tool_error_count: int = 0,
+    ) -> None:
+        """Attach why the agent loop stopped and how its tool calls failed.
+
+        The values become ``$ai_generation`` properties. ``last_tool_error`` is
+        redacted and capped like a tool event's ``error_message``.
+        """
+        outcome: dict[str, JsonValue] = {
+            "blocked_tool_calls": blocked_tool_calls,
+            "tool_error_count": tool_error_count,
+        }
+        for key, value in (
+            ("stop_reason", stop_reason),
+            ("goal_review_reason", goal_review_reason),
+            ("last_failed_tool", last_failed_tool),
+            ("last_tool_error", bounded_error_message(last_tool_error)),
+        ):
+            if text := value.strip():
+                outcome[key] = text
+        self._loop_outcome = outcome
+
+    def set_stopped_short(self) -> None:
+        """Record a turn whose loop stopped before a final answer, naming why.
+
+        Call after :meth:`set_loop_outcome`; its stop reason, goal review
+        reason, and last failure follow the generic text of the error.
+        """
+        details = "; ".join(
+            f"{key}={self._loop_outcome[key]}"
+            for key in _STOP_DETAIL_KEYS
+            if key in self._loop_outcome
+        )
+        self.set_error(
+            _STOPPED_SHORT_KIND,
+            f"{_STOPPED_SHORT_MESSAGE} {details}" if details else _STOPPED_SHORT_MESSAGE,
+        )
 
     @property
     def turn_id(self) -> str:
@@ -229,7 +299,7 @@ class PromptRecorder:
             session=session,
         )
 
-    def set_error(self, kind: str, message: str) -> None:
+    def set_error(self, kind: str, message: str, *, error: BaseException | None = None) -> None:
         """Attach a structured turn error emitted as ``$ai_error`` properties.
 
         The human-readable response text is unaffected; these properties make
@@ -242,7 +312,9 @@ class PromptRecorder:
             return
         self._error_kind = kind or "error"
         self._error_message = _sanitize_text(message, config=self._config)
-        if self._error_kind in LLM_PROVIDER_FAILURE_KINDS:
+        if error is not None:
+            self._ai_error_reason = credit_exhaustion_reason(error)
+        if self._error_kind in LLM_PROVIDER_FAILURE_KINDS or self._ai_error_reason:
             self._llm_attempted = True
 
     def set_response(self, text: str, run: _RunInfo | None = None) -> None:
@@ -298,6 +370,8 @@ class PromptRecorder:
             record["model_skill_prompt"] = self._model_skill
         if self._model_context:
             record["model_context"] = self._model_context
+        if self._model_blocks:
+            record["model_blocks"] = self._model_blocks
         if self._config.local_enabled:
             with contextlib.suppress(OSError):
                 append_prompt_log_record(path=self._config.log_path, record=record)
@@ -322,7 +396,10 @@ class PromptRecorder:
                 # failed, the turn is a failed LLM call — never a terminal
                 # action. Fall back to "unknown" instead of the terminal
                 # sentinel when the attempted model could not be resolved.
-                llm_provider_failed = self._error_kind in LLM_PROVIDER_FAILURE_KINDS
+                llm_provider_failed = (
+                    self._error_kind in LLM_PROVIDER_FAILURE_KINDS
+                    or self._ai_error_reason is not None
+                )
                 fallback_label = (
                     NO_CONVERSATIONAL_AGENT if self._llm_attempted is False else UNKNOWN_LLM
                 )
@@ -368,6 +445,7 @@ class PromptRecorder:
                 }
                 if self._llm_attempted is not None:
                     posthog_properties["llm_attempted"] = self._llm_attempted
+                posthog_properties.update(self._loop_outcome)
                 reported = 0
                 for key, value in (
                     ("$ai_input_tokens", self._input_tokens),
@@ -387,15 +465,23 @@ class PromptRecorder:
                     posthog_properties["$ai_error"] = self._error_message or self._error_kind
                     posthog_properties["error_kind"] = self._error_kind
                     if llm_provider_failed:
-                        posthog_properties["ai_error_kind"] = classify_provider_error_kind(
-                            self._error_message or self._error_kind
+                        posthog_properties["ai_error_kind"] = (
+                            "quota"
+                            if self._ai_error_reason
+                            else classify_provider_error_kind(
+                                self._error_message or self._error_kind
+                            )
                         )
+                    if self._ai_error_reason:
+                        posthog_properties["ai_error_reason"] = self._ai_error_reason
                 if self._model_system:
                     posthog_properties["model_system_prompt"] = self._model_system
                 if self._model_skill:
                     posthog_properties["model_skill_prompt"] = self._model_skill
                 if self._model_context:
                     posthog_properties["model_context"] = self._model_context
+                if self._model_blocks:
+                    posthog_properties["model_blocks"] = self._model_blocks
                 _fit_model_prompt(posthog_properties)
                 capture_ai_generation(posthog_properties)
 

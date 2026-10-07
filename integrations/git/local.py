@@ -25,10 +25,12 @@ from config.constants.git import (
     OPENSRE_COMMIT_COAUTHOR_TRAILER,
 )
 from config.constants.github import GITHUB_TOKEN_CHECKLIST
+from infrastructure.process.turn_capacity import HEAVY_WORK_BUSY_MESSAGE, heavy_work_slot
 from integrations.git.errors import (
     BRANCH_FAILED,
     COMMIT_FAILED,
     GIT_UNAVAILABLE,
+    HEAVY_WORK_BUSY,
     MERGE_FAILED,
     NOT_A_GIT_REPO,
     PROTECTED_BRANCH,
@@ -180,22 +182,31 @@ def clone_repository(url: str, workspace: str, *, token: str | None = None) -> N
     """Clone an HTTPS repository into *workspace* (absent or empty) without prompting.
 
     Credentials stay confined to the child's environment; without a token the
-    clone relies on the repository being public.
+    clone relies on the repository being public. A full clone is memory-heavy, so
+    it waits for a process-wide heavy-work slot and raises ``HEAVY_WORK_BUSY``
+    when none frees in time.
     """
     parsed = urlsplit(url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
         raise GitCommandError(NOT_A_GIT_REPO, "Cloning requires an HTTPS repository URL.")
     env = _token_auth_env(token, f"https://{parsed.netloc}/") if token else dict(os.environ)
     env["GIT_TERMINAL_PROMPT"] = "0"
-    result = _run_git(
-        os.path.dirname(workspace),
-        "clone",
-        "--",
-        url,
-        workspace,
-        env=env,
-        timeout=_GIT_CLONE_TIMEOUT_SEC,
-    )
+    with heavy_work_slot() as started:
+        result = (
+            _run_git(
+                os.path.dirname(workspace),
+                "clone",
+                "--",
+                url,
+                workspace,
+                env=env,
+                timeout=_GIT_CLONE_TIMEOUT_SEC,
+            )
+            if started
+            else None
+        )
+    if result is None:
+        raise GitCommandError(HEAVY_WORK_BUSY, HEAVY_WORK_BUSY_MESSAGE)
     if result.returncode != 0:
         raise GitCommandError(NOT_A_GIT_REPO, "Could not clone the selected repository.")
 
@@ -395,6 +406,27 @@ def checkout_branch(workspace: str, branch: str) -> None:
         )
 
 
+def _add_paths(workspace: str, paths: Sequence[str]) -> str:
+    """Stage exactly *paths*; return git's error text, or "" when all were staged.
+
+    Tracked paths go through ``git add -u``: plain ``git add <path>`` refuses a
+    tracked file inside a directory a ``.gitignore`` rule matches (a package
+    under an ``output/`` rule), while ``-u`` stages its change or deletion. New
+    files still go through ``git add -A``, so an ignored new file fails here
+    instead of being committed.
+    """
+    listed = _run_git(workspace, "ls-files", "-z", "--", *paths)
+    indexed = {path for path in listed.stdout.split("\0") if path}
+    tracked = [path for path in paths if path in indexed]
+    new = [path for path in paths if path not in indexed]
+    for flag, group in (("-u", tracked), ("-A", new)):
+        if group:
+            result = _run_git(workspace, "add", flag, "--", *group)
+            if result.returncode != 0:
+                return result.stderr.strip()
+    return ""
+
+
 def commit_paths(
     workspace: str,
     paths: Sequence[str],
@@ -416,9 +448,9 @@ def commit_paths(
     # handled by ``git commit --only``, which records their removal.
     existing = [p for p in paths if os.path.isfile(os.path.join(workspace, p))]
     if existing:
-        add = _run_git(workspace, "add", "--", *existing)
-        if add.returncode != 0:
-            raise GitCommandError(COMMIT_FAILED, f"git add failed: {add.stderr.strip()}")
+        error = _add_paths(workspace, existing)
+        if error:
+            raise GitCommandError(COMMIT_FAILED, f"git add failed: {error}")
 
     commit = _run_git(
         workspace,

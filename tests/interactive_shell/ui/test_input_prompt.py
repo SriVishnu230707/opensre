@@ -250,7 +250,7 @@ class TestResolvePromptPlaceholder:
     def test_default_when_no_session_context(self) -> None:
         session = Session()
         text = _placeholder_text(session)
-        assert text == "Ask about an alert"
+        assert text == "Drop a repo link. Watch it find your CI waste."
         assert "Enter send" not in text
 
     def test_placeholder_prompts_to_continue_an_unfinished_plan(self) -> None:
@@ -474,7 +474,7 @@ class TestResolvePromptPrefix:
             idle_hint=spinner.idle_hint_ansi(),
         )
         assert "preview line" not in prefix
-        assert "Press ESC to stop" in _strip_ansi(prefix)
+        assert "Esc to stop" in _strip_ansi(prefix)
 
     def test_completion_details_do_not_replace_runtime_status(self) -> None:
         spinner = loop_state.SpinnerState()

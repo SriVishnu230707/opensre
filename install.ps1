@@ -453,7 +453,7 @@ function Invoke-OpenSreWithRetry {
         [scriptblock]$Operation,
         [Parameter(Mandatory = $true)]
         [string]$Description,
-        [int]$MaxAttempts = 3
+        [int]$MaxAttempts = 6
     )
 
     $attempt = 1
@@ -465,20 +465,31 @@ function Invoke-OpenSreWithRetry {
         catch {
             $statusCode = Get-OpenSreHttpStatusCodeFromError -ErrorRecord $_
             if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500) {
-                if ($Description -eq "fetch release metadata from GitHub" -and
-                    ($statusCode -eq [int][System.Net.HttpStatusCode]::Forbidden -or
-                     $statusCode -eq [int][System.Net.HttpStatusCode]::TooManyRequests)) {
-                    throw "GitHub release API returned HTTP $statusCode. The API may be rate-limited; retry later or set GH_TOKEN (or GITHUB_TOKEN) to a valid GitHub token. Replace any rejected token. $($_.Exception.Message)"
+                $rateLimited = $statusCode -eq [int][System.Net.HttpStatusCode]::Forbidden -or
+                    $statusCode -eq [int][System.Net.HttpStatusCode]::TooManyRequests
+                if ($Description -eq "fetch release metadata from GitHub") {
+                    if ($rateLimited) {
+                        throw "GitHub release API returned HTTP $statusCode. The API may be rate-limited; retry later or set GH_TOKEN (or GITHUB_TOKEN) to a valid GitHub token. Replace any rejected token. $($_.Exception.Message)"
+                    }
+                    throw "Failed to $Description. $($_.Exception.Message)"
                 }
-                throw "Failed to $Description. $($_.Exception.Message)"
+                # Release assets may be temporarily rate-limited by their host.
+                if (-not $rateLimited) {
+                    throw "Failed to $Description. $($_.Exception.Message)"
+                }
             }
 
             if ($attempt -ge $MaxAttempts) {
                 throw "Failed to $Description after $attempt attempts. $($_.Exception.Message)"
             }
 
+            $wait = $attempt
+            if ($statusCode -eq 403 -or $statusCode -eq 429) {
+                $wait = [Math]::Min(30, [int][Math]::Pow(2, $attempt))
+            }
+
             Write-Warning "Attempt $attempt to $Description failed: $($_.Exception.Message). Retrying..."
-            Start-Sleep -Seconds $attempt
+            Start-Sleep -Seconds $wait
             $attempt += 1
         }
     }

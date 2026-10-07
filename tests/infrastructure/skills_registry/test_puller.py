@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from http import HTTPStatus
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -113,3 +117,66 @@ def test_pull_rejects_an_unsigned_release_and_does_not_cache_its_etag(
     assert release_store.latest_stored_seq() is None
     # No ETag kept, so a binary that later trusts the key fetches the release again.
     assert calls == ["", ""]
+
+
+_CLAIM_SCRIPT = """
+import sys
+from core.agent_harness.prompts.skills.snapshot.release_store import claim_announcement
+sys.stdout.write(str(claim_announcement("remote:7")))
+"""
+
+
+@pytest.mark.timeout(120)
+def test_one_process_claims_each_release_announcement(tmp_path: Path) -> None:
+    """Separate processes activating one release together report it once per machine."""
+    env = {**os.environ, "OPENSRE_HOME": str(tmp_path / "home")}
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CLAIM_SCRIPT],
+            cwd=Path(__file__).resolve().parents[3],
+            env=env,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(6)
+    ]
+    claims = [process.communicate(timeout=100)[0].strip() for process in processes]
+
+    assert sorted(claims) == ["False"] * 5 + ["True"]
+
+
+def test_an_explicit_update_waits_for_a_running_pull(
+    release_signer: ReleaseSigner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`skills update` must not report "skipped" because its own background pull holds the lock."""
+    import threading
+    import time
+
+    from filelock import FileLock
+
+    release = release_signer.sign(bundled_files(), seq=4)
+    order: list[str] = []
+
+    def fetch(app_url: str, *, etag: str = "", client: object = None) -> FetchResult:
+        order.append("fetched")
+        return FetchResult(FetchStatus.UPDATED, release=release, etag='"4"')
+
+    monkeypatch.setattr(puller_module, "fetch_release", fetch)
+    store = release_store.store_dir()
+    store.mkdir(parents=True, exist_ok=True)
+    held = threading.Event()
+
+    def background_pull() -> None:
+        with FileLock(str(store / ".fetch.lock")):
+            held.set()
+            time.sleep(0.5)
+            order.append("released")
+
+    holder = threading.Thread(target=background_pull)
+    holder.start()
+    assert held.wait(5)
+
+    assert pull_once(force=True, app_url=_APP).status is PullStatus.STORED
+    holder.join()
+    # Ordering, not timing: the forced pull fetched only after the holder let go.
+    assert order == ["released", "fetched"]

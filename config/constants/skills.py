@@ -12,6 +12,10 @@ SCHEDULING_GITHUB_CI_REPAIRS_SKILL_NAME = "scheduling-github-ci-repairs"
 DELEGATING_GITHUB_CI_REPAIRS_SKILL_NAME = "delegating-github-ci-repairs"
 CONNECTING_SLACK_SKILL_NAME = "connecting-slack"
 
+# Not a demo child: the analysis demo hands off to it when GitHub is not
+# connected, cannot be read, or the user's repositories have no GitHub Actions.
+ANALYZING_LOCAL_REPOSITORIES_SKILL_NAME = "analyzing-local-repositories"
+
 # Master onboarding menu the host opens on skill entry. When the four onboarding
 # children are present, the rows are the outcome choices below rather than each
 # child's ``getting_started`` label. The automation row opens a follow-up; the
@@ -85,4 +89,15 @@ SKILLS_RELEASE_MAX_FILES = 500
 SKILLS_RELEASES_KEPT = 3
 #: Release signing keys trusted by this binary (``key_id`` -> PEM public key).
 #: Two slots let a new key be trusted before the server starts using it.
-SKILLS_RELEASE_PUBLIC_KEYS: Mapping[str, str] = MappingProxyType({})
+SKILLS_RELEASE_PUBLIC_KEYS: Mapping[str, str] = MappingProxyType(
+    {
+        # AWS KMS alias/opensre-skills-release-signing (ECC_NIST_P256), used by
+        # app.opensre.com as SKILLS_SIGNING_KEY_ID=prod-1.
+        "prod-1": (
+            "-----BEGIN PUBLIC KEY-----\n"
+            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEqIjGLpdCv+iJzvtuyb7uTF/Xc1oj\n"
+            "c7be3W+HEHNCjUYP2/oCOpthVWCrytTQCXlFegIclquxYUMO8pTg2HChDw==\n"
+            "-----END PUBLIC KEY-----\n"
+        ),
+    }
+)

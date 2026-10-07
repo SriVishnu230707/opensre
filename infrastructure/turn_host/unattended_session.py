@@ -13,6 +13,7 @@ from typing import Any
 
 from core.agent_harness import SessionCore, SessionManager
 from core.agent_harness.spi.handoff import AskUserQuestion, format_ask_user_answers, question_key
+from core.agent_harness.spi.prompt_chrome import is_literal_command
 from core.agent_harness.spi.session_state import PendingUserChoice
 
 APPROVE_OPTION = "Approve"
@@ -37,15 +38,15 @@ class UnattendedSessions:
         prepare_unattended_session(session)
         return session
 
-    def open_conversation(self) -> SessionCore:
-        """Open or resume the hosted conversation in the caller's bound actor scope."""
-        existing = _hosted_conversation_id()
+    def hosted_conversation(self) -> str | None:
+        """The bound actor's own conversation id, when that conversation still exists."""
+        existing = hosted_conversation_id()
         if existing is not None and self._manager.has_session(existing):
-            session = self.resume(existing)
-            if session.pending_user_choice is None:
-                return session
-            # Only the original prompt's answer may resume its parked choice.
-            self.close(session)
+            return existing
+        return None
+
+    def open_hosted_conversation(self) -> SessionCore:
+        """Open a new conversation and make it the bound actor's own."""
         session = self.open()
         _remember_hosted_conversation(session.session_id)
         return session
@@ -56,6 +57,12 @@ class UnattendedSessions:
         prepare_unattended_session(session)
         return session
 
+    def resume_conversation(self, session_id: str) -> SessionCore | None:
+        """Resume one of the bound actor's conversations; ``None`` when it has no such session."""
+        if not self._manager.has_session(session_id):
+            return None
+        return self.resume(session_id)
+
     def flush(self, session: SessionCore) -> None:
         """Persist the session's state now, so a reload during the turn sees it."""
         self._manager.flush(session)
@@ -64,8 +71,8 @@ class UnattendedSessions:
         self._manager.close(session, wait_for_memory_extraction=False)
 
 
-def _hosted_conversation_id() -> str | None:
-    """Read the conversation binding from the caller's bound actor scope."""
+def hosted_conversation_id() -> str | None:
+    """The bound actor's own conversation id as stored; it may name a deleted session."""
     from config.constants.paths import session_home
 
     path = session_home() / "hosted-conversation"
@@ -101,6 +108,18 @@ def _remember_hosted_conversation(session_id: str) -> None:
 def prepare_unattended_session(session: SessionCore) -> None:
     """A question ends the turn as a pending choice instead of waiting for an answer."""
     session.available_capabilities["ask_user_choice"] = ("deferred",)
+
+
+def prompt_with_facts(prompt: str, facts: Mapping[str, str]) -> str:
+    """A remote prompt plus the facts its caller resolved up front, so nothing is left to ask.
+
+    A prompt the turn runs verbatim as a command is left as sent: appended facts
+    would reach the command as extra arguments.
+    """
+    if not facts or is_literal_command(prompt):
+        return prompt
+    lines = "\n".join(f"- {key}: {value}" for key, value in sorted(facts.items()))
+    return f"{prompt}\n\nKnown context:\n{lines}"
 
 
 def invocation_key(
@@ -259,10 +278,12 @@ __all__ = [
     "DENY_OPTION",
     "AnswerRejected",
     "UnattendedSessions",
+    "hosted_conversation_id",
     "answer_pending_choice",
     "approval_grant",
     "approval_question",
     "choice_view",
     "invocation_key",
     "prepare_unattended_session",
+    "prompt_with_facts",
 ]

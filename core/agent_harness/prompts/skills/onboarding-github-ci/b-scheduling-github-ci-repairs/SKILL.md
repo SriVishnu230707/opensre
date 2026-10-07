@@ -8,8 +8,8 @@ getting_started: Run continuously on this machine (recommended)
 demo_order: 2
 metadata:
   owner: Vincent
-  last_changed_by: Jan
-  last_changed_at: 2026-10-02
+  last_changed_by: Vincent
+  last_changed_at: 2026-10-04
   usecases:
     - For configuring ongoing repair of failing pull requests in one repository.
     - For demonstrating a scheduled repair in a disposable private repository.
@@ -17,7 +17,7 @@ metadata:
     - GitHub write access to the watched repository and an authenticated coding agent
     - Git installed on the scheduler host; repair checkouts are created automatically
     - For the demo, a GitHub token that can create a private repository and an example PR
-  version: "0.78"
+  version: "0.82"
 script_tools: references/script-tools.md
 ---
 
@@ -36,24 +36,24 @@ one real repair as fast as possible in well under five minutes.
 
 ## Plan
 
-Use `update_plan` to create the live plan from the workflow headings below. Mark a step `in_progress` or `completed` in the same response as that step's tool call. A response that only calls `update_plan` is not progress.
+Use `update_plan` to create the live plan from the workflow headings below. Mark a step `in_progress` or `completed` in the same response as that step's tool call. A response that only calls `update_plan` is not progress. For the private demo, plan three steps instead: run the demo with one `run_ci_repair_demo` call (`verifies: true`), respond with the outcome report (`deliverable: true`), then offer the follow-up with `ask_user_choice`: the hand-off after a successful repair, or the blocker question after a blocked or failed run.
 
 - [ ] Check prerequisites: GitHub identity and scopes, then the scheduler.
 - [ ] Select the repository, or the private demo, with ask_user_choice.
 - [ ] Select the failing PR, or confirm the authorized demo scope.
-- [ ] Create the demo repository, failing branch, and PR with `seed_ci_repair_demo` (demo only).
+- [ ] Run the demo with one `run_ci_repair_demo` call (demo only).
 - [ ] Schedule the bounded repair with schedule_ci_repair_loop and record its task id.
 - [ ] Wait until the repair is terminal with one `get_ci_repair_loop` call and read its report.
 - [ ] Verify the repair with one `pr view` call.
 - [ ] Save evidence, remove the demo loop, and verify with one `finish_ci_repair_demo` call.
 - [ ] Respond with the outcome report as Markdown.
-- [ ] After the report is shown, offer the follow-up with `ask_user_choice`.
+- [ ] After the report is shown, offer the follow-up with `ask_user_choice`: the hand-off after a success, the blocker question otherwise.
 
 ## Workflow
 
 ### Step 1. Check prerequisites
 
-Two calls, one per response:
+Skip this step for the private demo: `run_ci_repair_demo` checks the token and the scheduler itself. Otherwise, two calls, one per response:
 
 **confirm authentication and print token:**
 
@@ -72,7 +72,7 @@ Two calls, one per response:
 ### Step 2. Select the repository
 
 Use the repository already named by the user and skip the rest of this step.
-An opening answer `Create <owner>/<repo>` or `Create <repo>` names that demo repository. Skip the scan and `ask_user_choice`. A name without an owner uses the login from Step 1. `Don't create a demo repository` keeps the picker below.
+An opening answer `Create <owner>/<repo>` or `Create <repo>` names that demo repository. Skip the scan and `ask_user_choice`. A name without an owner leaves `owner` empty; the demo tool uses the token's login. `Don't create a demo repository` keeps the picker below.
 Otherwise, two calls, one per response:
 
 **find what is red right now:**
@@ -115,9 +115,9 @@ The scope was authorized in Step 1; nothing to fetch.
 
 ### Step 4. Create the demo failure (Demo only)
 
-Call `seed_ci_repair_demo(owner="<owner>", repo="<repo>")`. One failed seed is the blocker. Do not call `seed_ci_repair_demo` again in this plan. Report the tool's error text.
+Call `run_ci_repair_demo(owner="<owner>", repo="<repo>")` once. It seeds the demo below, schedules the bounded repair with the demo's fast checks, waits until it is terminal, reads the PR once, saves evidence, and removes the loop, so Steps 5–8 are done when it returns. Record its ids, evidence, and `loop_removed`, then go to Step 9. One failed run is the blocker. Do not call it again in this plan. Report the tool's error text.
 
-The tool treats a 404 from `GET /repos/{owner}/{repo}` as absence and creates the private repository only in that case. It commits a passing `main` (`calculator.py` adding, `test_calculator.py` asserting `add(2, 3) == 5`, and `.github/workflows/test.yml` named `Demo calculator CI` running `python -m unittest -v` on push and pull_request), then one commit on `demo/failing-ci` that changes only `calculator.py` so `add` subtracts, opens that pull request into `main` with a body that says it is a demo not to merge, and returns after the pull-request Actions run has failed. Record `pr_url`, `pr_number`, `head_sha`, and `failed_run_id`. An existing demo repository and pull request are reused. If that repository is not an OpenSRE CI repair demo, the tool leaves it unchanged and seeds `opensre-ci-repair-demo-<4 lowercase letters or digits>` on the same owner. Record `owner`, `repo`, `pr_url`, `pr_number`, `head_sha`, and `failed_run_id` from the result, and use that owner and repo in later steps. Stay in this plan. Do not call `ask_user_choice`, do not end the turn, and do not delete or overwrite the refused repository.
+The tool treats a 404 from `GET /repos/{owner}/{repo}` as absence and creates the private repository only in that case. It commits a passing `main` (`calculator.py` adding, `test_calculator.py` asserting `add(2, 3) == 5`, and `.github/workflows/test.yml` named `Demo calculator CI` running `python -m unittest -v` on pull_request), then one commit on `demo/failing-ci` that changes only `calculator.py` so `add` subtracts, opens that pull request into `main` with a body that says it is a demo not to merge, and returns after the pull-request Actions run has failed. Record `pr_url`, `pr_number`, `head_sha`, and `failed_run_id`. An existing demo repository and pull request are reused. If that repository is not an OpenSRE CI repair demo, the tool leaves it unchanged and seeds `opensre-ci-repair-demo-<4 lowercase letters or digits>` on the same owner. Record `owner`, `repo`, `pr_url`, `pr_number`, `head_sha`, and `failed_run_id` from the result, and use that owner and repo in later steps. Stay in this plan. Do not call `ask_user_choice`, do not end the turn, and do not delete or overwrite the refused repository.
 
 This step uses that one tool. `github_cli`, `list_github_actions_workflow_runs`, an organization repository listing, a code search, and plain `git` are outside this step.
 
@@ -198,12 +198,16 @@ Respond with the report as Markdown, linking the PR inline: PR, failed run id, l
 
 Claim success only when detection, scheduled repair, passing checks, and (for the demo) loop removal are all evidenced.
 
+Do not call `memory_recall` or `memory_remember` in this workflow.
+
 **Complete this step when:**
 Complete when the report has been shown to the user as Markdown text.
 
 ### Step 10. Offer the follow-up question
 
-After the report is shown, call `ask_user_choice` with the title `Hand off the next failure?`, `allow_custom` false, and this note:
+After a blocked or failed run, ask the blocker question instead of the menu below: call `ask_user_choice` naming the blocked run step and its blocker, with options a tool here can carry out and one to leave it blocked. On the hosted gateway, skip the menu below after a successful report and mark this item completed; the shell that delegated the work owns follow-ups.
+
+After a successful repair report is shown, call `ask_user_choice` with the title `Hand off the next failure?`, `allow_custom` false, and this note:
 
 `The local loop runs on this machine every 30 seconds while it is on. The managed-service option is one repair, then it stops.`
 
@@ -212,7 +216,7 @@ Options:
 - Auto-fix failing PRs on one of your repos from your local laptop
 - Not now
 
-Complete when the `ask_user_choice` call for this menu has returned in this turn. The user's answer arrives in the next turn. Each branch except `Not now` is owned by a skill: load it with `skill_view` and follow its plan; do not reimplement its steps here.
+Complete when the `ask_user_choice` call for the blocker question or this menu has returned in this turn. The user's answer arrives in the next turn. Each branch except `Not now` is owned by a skill: load it with `skill_view` and follow its plan; do not reimplement its steps here.
 
 - **Run the next fix in the cloud and close your laptop:** call `skill_view(name="delegating-github-ci-repairs")` and follow that skill. That skill runs one repair on the hosted gateway. Do not describe it as a loop that keeps running.
 - **Auto-fix failing PRs on one of your repos from your local laptop:** call `skill_view(name="scheduling-github-ci-repairs")` and follow that skill again. Do not reuse the private demo. Select a repository the user already uses, so the loop stays after the report.

@@ -260,6 +260,49 @@ def test_a_revoked_token_clears_the_snapshot_and_bumps_the_generation(
     assert acct.account_integrations_generation() == generation_after_fetch + 1
 
 
+def test_the_setup_page_is_the_signed_in_organizations_home(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _signed_in(monkeypatch)
+
+    assert acct.account_setup_url() == "https://app.test/home?org_id=org-1"
+
+
+def test_a_refresh_moves_the_generation_forward_and_survives_an_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``refresh`` reads the app again; it must not wipe the cache to do it.
+
+    Wiping restarted the generation at zero, so a remote set that changed
+    across the refresh kept the same generation: ``integration_sources_stamp``
+    never moved and other sessions kept serving their stale credentials. An
+    outage during the refresh also threw away the last good snapshot.
+    """
+    # Arrange: GitHub is connected in the app after the first read.
+    _signed_in(monkeypatch)
+    _respond_with(
+        monkeypatch,
+        [
+            httpx.Response(200, json={"success": True, "data": []}),
+            httpx.Response(200, json=_vault_payload()),
+            httpx.ConnectError("offline"),
+        ],
+    )
+    assert acct.load_account_integrations() == []
+    generation_before = acct.account_integrations_generation()
+
+    # Act: re-read within the TTL, as "I've connected GitHub — continue" does.
+    refreshed = acct.load_account_integrations(refresh=True)
+    generation_after = acct.account_integrations_generation()
+    during_outage = acct.load_account_integrations(refresh=True)
+
+    # Assert
+    assert refreshed[0]["service"] == "github"
+    assert generation_after > generation_before
+    assert during_outage == refreshed
+    assert acct.account_integrations_generation() == generation_after
+
+
 def _expire_ttl_after_first_load(monkeypatch: pytest.MonkeyPatch) -> int:
     """Load once, then move the clock one TTL forward; return the generation."""
     acct.load_account_integrations()
@@ -271,3 +314,33 @@ def _expire_ttl_after_first_load(monkeypatch: pytest.MonkeyPatch) -> int:
 
     monkeypatch.setattr(acct, "time", SimpleNamespace(monotonic=later))
     return generation
+
+
+def test_the_apps_slack_install_is_the_cli_slack_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The app names its Slack OAuth install ``slack_bot``; the CLI knows it as ``slack``."""
+    _signed_in(monkeypatch)
+    payload = {
+        "success": True,
+        "data": [
+            {
+                "id": "slack-org-1",
+                "service": "slack_bot",
+                "status": "active",
+                "name": "default",
+                "credentials": {"bot_token": "xoxb-app"},
+            }
+        ],
+    }
+    _respond_with(monkeypatch, [httpx.Response(200, json=payload)])
+
+    records = acct.load_account_integrations()
+    effective = resolve_effective_integrations(
+        store_integrations=[], env_integrations=[], remote_integrations=records
+    )
+
+    assert [record["service"] for record in records] == ["slack"]
+    assert effective["slack"]["source"] == "remote"
+    assert effective["slack"]["config"]["bot_token"] == "xoxb-app"
+    assert "slack_bot" not in effective

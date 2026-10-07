@@ -11,6 +11,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+from config.constants.tool_params import config_only_params
+from config.constants.tooling import ToolBlockedBy, ToolSkippedBy
 from core.domain.types.tools import ToolRole
 from core.llm.types import ToolCall
 from core.tool.contracts import AgentTool, AgentToolContext, RuntimeTool
@@ -22,13 +24,21 @@ from infrastructure.observability.trace.observations import (
     observe_tool,
 )
 from infrastructure.observability.trace.redaction import redact_sensitive
-from infrastructure.observability.trace.spans import mark_span_outcome, tool_span
+from infrastructure.observability.trace.spans import (
+    is_session_trace_active,
+    mark_span_outcome,
+    tool_span,
+)
 
 logger = logging.getLogger(__name__)
 _TOOL_LOGGER = logging.getLogger("tools")
 
 _UNSET: object = object()
 _EXECUTED_TOOL_OUTCOMES = frozenset({"ok", "tool_error", "exception"})
+# Result metadata flags: a before_tool_call hook refused the call, or the call
+# was skipped without running because the turn ended or was cancelled first.
+_BLOCKED_METADATA_KEY = "blocked"
+_SKIPPED_METADATA_KEY = "skipped"
 
 
 def availability_view(resolved_integrations: dict[str, Any]) -> dict[str, Any]:
@@ -248,14 +258,17 @@ def execute_tool_calls(
     tool_resources: dict[str, Any] | None = None,
     should_stop: Callable[[], bool] | None = None,
     on_call_start: Callable[[ToolCall], None] | None = None,
+    iteration: int | None = None,
 ) -> list[ToolExecutionResult]:
     """Execute provider-requested tools sequentially and return structured results.
 
     A response may carry several calls; they run one after another in provider
-    order. A ``TURN_ENDING`` call hands control to the user and must be the
-    only call in its response — a response that breaks that rule executes
-    nothing: every call gets the same error so the model re-issues the menu
-    alone. Once a result terminates the turn, or ``should_stop`` reports a
+    order. A ``TURN_ENDING`` call hands control to the user; only
+    ``BOOKKEEPING`` calls may share its response, and they run before it so a
+    plan write lands before the menu ends the turn. A response that breaks
+    that rule executes nothing: every call gets the same error so the model
+    re-issues the menu. Results keep provider order. Once a result
+    terminates the turn, or ``should_stop`` reports a
     host cancel, the remaining calls are skipped: each still gets an error
     result (providers require one per tool-call id) that says it did not run,
     marked ``metadata.skipped``.
@@ -263,6 +276,9 @@ def execute_tool_calls(
     ``on_call_start`` fires immediately before a call executes — never for a
     skipped call or a rejected batch — so a host can write a durable per-call
     intent record that only ever covers work that actually started.
+
+    ``iteration`` is the loop iteration that requested the calls; analytics
+    records it beside each call's position in the response.
     """
 
     hooks = hooks or ToolExecutionHooks()
@@ -270,7 +286,7 @@ def execute_tool_calls(
     violation = response_batch_violation(tool_calls, tool_map)
     if violation is not None:
         logger.debug("tool_batch rejected calls=%s", [tc.name for tc in tool_calls])
-        for tc in tool_calls:
+        for index, tc in enumerate(tool_calls):
             _capture_tool_call_analytics(
                 tc,
                 tool=tool_map.get(tc.name),
@@ -279,6 +295,8 @@ def execute_tool_calls(
                 terminate=False,
                 duration_ms=0,
                 error_message=violation,
+                iteration=iteration,
+                tool_call_index=index,
             )
         return [
             _error_result(violation, metadata={"tool_name": tc.name, "batch_rejected": True})
@@ -289,14 +307,17 @@ def execute_tool_calls(
     tool_sources = availability_view(resolved_integrations)
     runtime_resources = dict(tool_resources or {})
 
-    results: list[ToolExecutionResult] = []
+    results: dict[int, ToolExecutionResult] = {}
     stop_reason: str | None = None
-    for tc in tool_calls:
+    skipped_by: ToolSkippedBy | None = None
+    for index in _execution_order(tool_calls, tool_map):
+        tc = tool_calls[index]
         if stop_reason is None and should_stop is not None and should_stop():
             stop_reason = "the turn was cancelled"
+            skipped_by = ToolSkippedBy.HOST_CANCEL
         if stop_reason is not None:
             skipped = _skipped_result(tc.name, stop_reason)
-            results.append(skipped)
+            results[index] = skipped
             _capture_tool_call_analytics(
                 tc,
                 tool=tool_map.get(tc.name),
@@ -305,6 +326,9 @@ def execute_tool_calls(
                 terminate=False,
                 duration_ms=0,
                 error_message=str(skipped.content),
+                skipped_by=skipped_by,
+                iteration=iteration,
+                tool_call_index=index,
             )
             continue
         if on_call_start is not None:
@@ -327,12 +351,13 @@ def execute_tool_calls(
                 hooks=hooks,
                 span_attrs=span_attrs,
             )
+            _trace_error_message(span_attrs, result)
             observation.update(
                 output=result.compat_payload(),
                 level=ObservationLevel.ERROR if result.is_error else None,
                 metadata={"is_error": result.is_error, "terminate": result.terminate},
             )
-            results.append(result)
+            results[index] = result
         _capture_tool_call_analytics(
             tc,
             tool=tool_map.get(tc.name),
@@ -342,10 +367,27 @@ def execute_tool_calls(
             duration_ms=max(0, round((time.monotonic() - started) * 1000)),
             details=result.details,
             error_message=_descriptive_tool_error(result),
+            span_attrs=span_attrs,
+            iteration=iteration,
+            tool_call_index=index,
         )
         if result.terminate:
             stop_reason = f"{tc.name} ended the turn"
-    return results
+            skipped_by = ToolSkippedBy.TURN_TERMINATED
+    return [results[index] for index in range(len(tool_calls))]
+
+
+def _execution_order(
+    tool_calls: Sequence[ToolCall], tool_map: Mapping[str, RuntimeTool]
+) -> list[int]:
+    """Call indexes in run order: provider order, with a turn-ending call moved last."""
+    ending = {
+        index
+        for index, tc in enumerate(tool_calls)
+        if tool_role(tool_map.get(tc.name)) is ToolRole.TURN_ENDING
+    }
+    rest = [index for index in range(len(tool_calls)) if index not in ending]
+    return [*rest, *sorted(ending)]
 
 
 def _descriptive_tool_error(result: ToolExecutionResult) -> str:
@@ -363,6 +405,86 @@ def _descriptive_tool_error(result: ToolExecutionResult) -> str:
     return ""
 
 
+def _trace_error_message(span_attrs: dict[str, Any], result: ToolExecutionResult) -> None:
+    """Put a failed call's redacted, capped error text on its local trace span."""
+    if not result.is_error or not is_session_trace_active():
+        return
+    description = _descriptive_tool_error(result)
+    if not description:
+        return
+    # Deferred like the analytics capture: importing core.tool must not load
+    # the analytics provider stack.
+    from infrastructure.analytics.event_properties import bounded_error_message
+
+    span_attrs["error_message"] = bounded_error_message(description)
+
+
+def _blocked_call_facts(metadata: Mapping[str, Any]) -> dict[str, str]:
+    """Which hook refused a call, from the metadata its decision carried."""
+    blocker = next((hook for hook in ToolBlockedBy if metadata.get(hook)), None)
+    if blocker is None:
+        return {}
+    if blocker is ToolBlockedBy.HOOK_EXCEPTION:
+        return {"blocked_by": blocker.value, "exception_type": str(metadata[blocker])}
+    return {"blocked_by": blocker.value}
+
+
+def _exception_error_class(exc: Exception) -> str | None:
+    """The stable failure ``kind`` an expected tool exception declares, if any."""
+    kind = getattr(exc, "kind", None)
+    return kind if isinstance(kind, str) and kind.strip() else None
+
+
+def _payload_text(payload: Mapping[str, Any], key: str) -> str:
+    value = payload.get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureFacts:
+    """Why one call failed, as analytics records it; never arguments or evidence."""
+
+    blocked_by: str = ""
+    exception_type: str = ""
+    error_class: str = ""
+    unavailable: bool = False
+    error_source: str = ""
+    setup_command: str = ""
+
+
+_NO_FAILURE = _FailureFacts()
+
+
+def _failure_facts(details: Any, span_attrs: Mapping[str, Any]) -> _FailureFacts:
+    """Why a call failed, from its span and the tool's own payload.
+
+    The span holds what the executor saw (blocking hook, exception type and
+    class). The payload adds the tool's ``error_kind`` and, for the
+    ``tool_unavailable`` envelope, its source and setup command.
+    """
+    # Deferred like the analytics capture: importing the contract (core.tool)
+    # must not load the authoring package (core.tool_framework) with it.
+    from core.tool_framework.utils.tool_availability import (
+        envelope_source_id,
+        is_tool_unavailable_envelope,
+    )
+
+    payload: Mapping[str, Any] = details if isinstance(details, dict) else {}
+    facts = _FailureFacts(
+        blocked_by=str(span_attrs.get("blocked_by") or ""),
+        exception_type=str(span_attrs.get("exception_type") or ""),
+        error_class=str(span_attrs.get("error_class") or _payload_text(payload, "error_kind")),
+    )
+    if not is_tool_unavailable_envelope(details):
+        return facts
+    return replace(
+        facts,
+        unavailable=True,
+        error_source=envelope_source_id(details) or "",
+        setup_command=_payload_text(details, "setup_command"),
+    )
+
+
 def _capture_tool_call_analytics(
     tool_call: ToolCall,
     *,
@@ -373,11 +495,16 @@ def _capture_tool_call_analytics(
     duration_ms: int,
     details: Any = None,
     error_message: str = "",
+    span_attrs: Mapping[str, Any] | None = None,
+    skipped_by: ToolSkippedBy | None = None,
+    iteration: int | None = None,
+    tool_call_index: int | None = None,
 ) -> None:
     """Emit product analytics without tool arguments or result evidence.
 
-    A failure includes the tool's descriptive error. Evidence payloads stay off
-    the event; they can contain private data.
+    A failure includes the tool's descriptive error and why it failed, as far
+    as the executor and the tool's payload say. Evidence payloads stay off the
+    event; they can contain private data.
     """
     from infrastructure.analytics.capture import capture_agent_tool_call_completed
 
@@ -386,7 +513,12 @@ def _capture_tool_call_analytics(
     work_status = (
         status if status in ("noop", "blocked", "failed", "incomplete", "succeeded") else ""
     )
-    recorded_error = error_message.strip()
+    failure = _failure_facts(details, span_attrs or {}) if is_error else _NO_FAILURE
+    recorded_error = error_message.strip() if is_error else ""
+    if is_error and not recorded_error:
+        # A failure with no text of its own is still recorded as one, so an
+        # undescribed error path shows up by name instead of as a blank.
+        recorded_error = f"{tool_call.name} failed ({outcome}) without an error message."
     capture_agent_tool_call_completed(
         tool_call_id=tool_call.id,
         tool_name=tool_call.name,
@@ -398,7 +530,16 @@ def _capture_tool_call_analytics(
         terminate=terminate,
         duration_ms=duration_ms,
         work_status=work_status,
-        **({"error_message": recorded_error} if is_error and recorded_error else {}),
+        error_message=recorded_error,
+        blocked_by=failure.blocked_by,
+        skipped_by=skipped_by.value if skipped_by is not None else "",
+        exception_type=failure.exception_type,
+        error_class=failure.error_class,
+        unavailable=failure.unavailable,
+        setup_command=failure.setup_command,
+        error_source=failure.error_source,
+        iteration=iteration,
+        tool_call_index=tool_call_index,
     )
 
 
@@ -414,7 +555,10 @@ def response_batch_violation(
     tool_calls: Sequence[ToolCall],
     tool_map: Mapping[str, RuntimeTool],
 ) -> str | None:
-    """Explain why one response's tool calls break the lone-menu rule, or ``None``."""
+    """Explain why one response's tool calls break the lone-menu rule, or ``None``.
+
+    A turn-ending call may share its response only with bookkeeping calls.
+    """
     if len(tool_calls) <= 1:
         return None
     roles = [tool_role(tool_map.get(tc.name)) for tc in tool_calls]
@@ -422,13 +566,17 @@ def response_batch_violation(
     turn_ending = [
         tc.name for tc, role in zip(tool_calls, roles, strict=True) if role is ToolRole.TURN_ENDING
     ]
-    if turn_ending:
-        return (
-            f"Nothing ran: {turn_ending[0]} hands the turn to the user and must be the only "
-            f"tool call in a response, but this response requested {len(tool_calls)} "
-            f"({requested}). Re-issue {turn_ending[0]} alone, after any other work."
-        )
-    return None
+    if not turn_ending:
+        return None
+    others = [role for role in roles if role is not ToolRole.TURN_ENDING]
+    if len(turn_ending) == 1 and all(role is ToolRole.BOOKKEEPING for role in others):
+        return None
+    return (
+        f"Nothing ran: {turn_ending[0]} hands the turn to the user and only bookkeeping "
+        f"such as update_plan may share its response, but this response requested "
+        f"{len(tool_calls)} ({requested}). Re-issue {turn_ending[0]} after any other work, "
+        "with at most the update_plan that marks its step."
+    )
 
 
 def execute_tools(
@@ -516,14 +664,16 @@ def _execute_one_tool_call(
         )
         before = _run_before_hook(hooks, request)
         if before is not None and before.blocked:
-            mark_span_outcome(span_attrs, "blocked", error=True)
+            mark_span_outcome(
+                span_attrs, "blocked", error=True, **_blocked_call_facts(before.metadata)
+            )
             logger.debug("tool_call blocked name=%s id=%s", tc.name, tc.id)
             return ToolExecutionResult(
                 content=before.reason or f"{tc.name} blocked by before_tool_call hook.",
                 details=before.details,
                 is_error=True,
                 terminate=before.terminate,
-                metadata={"tool_name": tc.name, **before.metadata},
+                metadata={"tool_name": tc.name, **before.metadata, _BLOCKED_METADATA_KEY: True},
             )
 
         logger.debug("tool_call start name=%s id=%s source=%s", tc.name, tc.id, source)
@@ -555,7 +705,13 @@ def _execute_one_tool_call(
         )
         return result
     except Exception as exc:
-        mark_span_outcome(span_attrs, "exception", error=True)
+        mark_span_outcome(
+            span_attrs,
+            "exception",
+            error=True,
+            exception_type=type(exc).__name__,
+            error_class=_exception_error_class(exc),
+        )
         logger.warning("[tool:%s] failed: %s", tc.name, exc)
         result = _error_result(str(exc), metadata={"tool_name": tc.name})
         # Raised transport failures must still reach after_tool_call so gather
@@ -587,14 +743,7 @@ def _invoke_runtime_tool(
         )
         return tool.execute(tc.input, context)
 
-    injected = tool.extract_params(tool_sources)
-    kwargs = {**injected, **tc.input}
-    # Vendor-agnostic: each tool declares which extract_params keys must win
-    # over model input (secrets / connection fields). See ``injected_params``.
-    protected = frozenset(getattr(tool, "injected_params", ()) or ())
-    for key, value in injected.items():
-        if key in protected and value not in (None, "", []):
-            kwargs[key] = value
+    kwargs = _model_arguments(tool, tool.extract_params(tool_sources), tc.input)
     if getattr(tool, "accepts_runtime_context", False):
         context = AgentToolContext(
             resolved_integrations=resolved_integrations,
@@ -603,6 +752,21 @@ def _invoke_runtime_tool(
         )
         return tool.run(**kwargs, context=context)
     return tool.run(**kwargs)
+
+
+def _model_arguments(
+    tool: Any, injected: Mapping[str, Any], model_input: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Merge configured values with model input; config-only names come from config alone.
+
+    Other ``extract_params`` keys stay defaults the model may override.
+    """
+    hidden = config_only_params(
+        str(getattr(tool, "name", "")),
+        tuple(getattr(tool, "injected_params", ()) or ()),
+    )
+    allowed_input = {key: value for key, value in model_input.items() if key not in hidden}
+    return {**injected, **allowed_input}
 
 
 def _normalize_result(raw: Any, *, tool_name: str) -> ToolExecutionResult:
@@ -636,7 +800,7 @@ def _skipped_result(tool_name: str, reason: str) -> ToolExecutionResult:
     return _error_result(
         f"Not run: {reason}, so this call was skipped. "
         "Re-issue it next turn if it is still needed.",
-        metadata={"tool_name": tool_name, "skipped": True},
+        metadata={"tool_name": tool_name, _SKIPPED_METADATA_KEY: True},
     )
 
 
@@ -659,7 +823,11 @@ def _run_before_hook(
         return hooks.before_tool_call(request)
     except Exception as exc:  # noqa: BLE001 - lifecycle hooks should fail closed for the call
         logger.warning("[tool:%s] before_tool_call failed: %s", request.tool_call.name, exc)
-        return BeforeToolCallResult(blocked=True, reason=str(exc))
+        return BeforeToolCallResult(
+            blocked=True,
+            reason=str(exc),
+            metadata={ToolBlockedBy.HOOK_EXCEPTION: type(exc).__name__},
+        )
 
 
 def _run_after_hook(
@@ -734,3 +902,42 @@ def summarise(output: Any) -> str:
         return f"error: {output['error']}"
     text = json.dumps(output, default=str)
     return text[:120] + "..." if len(text) > 120 else text
+
+
+@dataclass(frozen=True, slots=True)
+class ToolFailureSummary:
+    """How a run's tool calls failed: counts and the last failure's own account.
+
+    Every failed call counts, blocked ones included; a call skipped without
+    running is not a failure.
+    """
+
+    tool_error_count: int = 0
+    blocked_tool_calls: int = 0
+    last_failed_tool: str = ""
+    last_tool_error: str = ""
+
+
+def summarize_tool_failures(
+    tool_results: Sequence[tuple[ToolCall, ToolExecutionResult]],
+) -> ToolFailureSummary:
+    """Summarize the failed calls in ``tool_results``, in the order they ran."""
+    errors = 0
+    blocked = 0
+    last_failure: tuple[ToolCall, ToolExecutionResult] | None = None
+    for tool_call, result in tool_results:
+        if not result.is_error or result.metadata.get(_SKIPPED_METADATA_KEY):
+            continue
+        errors += 1
+        if result.metadata.get(_BLOCKED_METADATA_KEY):
+            blocked += 1
+        last_failure = (tool_call, result)
+    if last_failure is None:
+        return ToolFailureSummary()
+    tool_call, result = last_failure
+    return ToolFailureSummary(
+        tool_error_count=errors,
+        blocked_tool_calls=blocked,
+        last_failed_tool=tool_call.name,
+        last_tool_error=_descriptive_tool_error(result),
+    )

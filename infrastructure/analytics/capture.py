@@ -4,14 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from typing import Final, cast
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
+from config.constants.analytics import LLMCreditErrorReason
 from infrastructure.analytics.event_properties import (
     _bounded_redacted_text,
     _bucket_duration_ms,
     _bucket_percentage,
     _integration_lifecycle_properties,
     _onboard_completed_properties,
+    bounded_error_message,
 )
 from infrastructure.analytics.events import Event, cli_command_event_name
 from infrastructure.analytics.provider import (
@@ -20,12 +22,20 @@ from infrastructure.analytics.provider import (
     analytics_opted_out,
     get_analytics,
 )
+from infrastructure.analytics.repl_context import get_prompt_turn_id
 from infrastructure.observability.errors.sentry import capture_exception
 
 _ASK_USER_LABEL_MAX_CHARS: Final[int] = 80
 _ASK_USER_TITLE_MAX_CHARS: Final[int] = 500
 _ASK_USER_OPTION_MAX_CHARS: Final[int] = 300
-_TOOL_ERROR_MESSAGE_MAX_CHARS: Final[int] = 500
+# Category-like tool facts: an exception type, an error kind, a source id.
+_TOOL_FACT_MAX_CHARS: Final[int] = 80
+_TOOL_SETUP_COMMAND_MAX_CHARS: Final[int] = 200
+# A loop report and its prompt: even escaped as non-ASCII JSON they stay well
+# under the 256 KiB event payload limit.
+_LOOP_REPORT_MAX_CHARS: Final[int] = 20_000
+_LOOP_PROMPT_MAX_CHARS: Final[int] = 4_000
+_LOOP_ID_MAX_CHARS: Final[int] = 200
 
 EVAL_AND_TERMINAL_KPI_QUERIES: Final[dict[str, str]] = {
     "terminal_action_execution_success_rate": """
@@ -105,6 +115,11 @@ def capture_account_authenticated() -> None:
         capture_exception(exc)
 
 
+def capture_connection_snapshot(properties: Properties) -> None:
+    """Record verified/unknown local GitHub state without credentials."""
+    _capture(Event.GITHUB_CONNECTION_SNAPSHOT, properties)
+
+
 def capture_sign_in_prompted() -> None:
     """Exposure event: the mandatory sign-in screen was rendered to a signed-out user."""
     _capture(Event.SIGN_IN_PROMPTED, {"entrypoint": "sign_in_gate"})
@@ -131,14 +146,35 @@ def capture_gateway_turn_started(*, surface: str) -> None:
     _capture(Event.GATEWAY_TURN_STARTED, {"surface": surface})
 
 
+def _turn_memory_properties(
+    container_memory_bytes: int | None,
+    container_memory_peak_bytes: int | None,
+    process_rss_delta_bytes: int | None,
+) -> Properties:
+    """Turn-end memory readings as event properties, omitting unknown ones."""
+    readings: dict[str, int | None] = {
+        "container_memory_bytes": container_memory_bytes,
+        "container_memory_peak_bytes": container_memory_peak_bytes,
+        "process_rss_delta_bytes": process_rss_delta_bytes,
+    }
+    return {key: value for key, value in readings.items() if value is not None}
+
+
 def capture_gateway_turn_completed(
     *,
     surface: str,
     duration_ms: float,
     answered: bool,
     final_intent: str | None = None,
+    container_memory_bytes: int | None = None,
+    container_memory_peak_bytes: int | None = None,
+    process_rss_delta_bytes: int | None = None,
 ) -> None:
-    """Mark successful completion of one gateway agent turn."""
+    """Mark successful completion of one gateway agent turn.
+
+    The memory readings are taken at turn end; the container peak is
+    lifetime-wide, so none of them is attributable to this turn alone.
+    """
     props: Properties = {
         "surface": surface,
         "duration_ms": round(duration_ms),
@@ -147,6 +183,9 @@ def capture_gateway_turn_completed(
     }
     if final_intent:
         props["final_intent"] = final_intent
+    props |= _turn_memory_properties(
+        container_memory_bytes, container_memory_peak_bytes, process_rss_delta_bytes
+    )
     _capture(Event.GATEWAY_TURN_COMPLETED, props)
 
 
@@ -155,11 +194,17 @@ def capture_gateway_turn_failed(
     surface: str | None,
     duration_ms: float,
     error_type: str,
+    error_message: str = "",
+    container_memory_bytes: int | None = None,
+    container_memory_peak_bytes: int | None = None,
+    process_rss_delta_bytes: int | None = None,
 ) -> None:
     """Mark a failed gateway agent turn (exception during dispatch).
 
     ``surface`` may be omitted when transport context was unbound so failures
-    still land in product analytics for regression detection.
+    still land in product analytics for regression detection. ``error_message``
+    is redacted and capped before it is recorded. Memory readings are as for
+    :func:`capture_gateway_turn_completed`.
     """
     props: Properties = {
         "duration_ms": round(duration_ms),
@@ -169,6 +214,11 @@ def capture_gateway_turn_failed(
     }
     if surface:
         props["surface"] = surface
+    if recorded_error := bounded_error_message(error_message):
+        props["error_message"] = recorded_error
+    props |= _turn_memory_properties(
+        container_memory_bytes, container_memory_peak_bytes, process_rss_delta_bytes
+    )
     _capture(Event.GATEWAY_TURN_FAILED, props)
 
 
@@ -269,6 +319,31 @@ def capture_terminal_actions_executed(
     )
 
 
+def capture_llm_credit_limit_reached(
+    *,
+    reason_code: LLMCreditErrorReason,
+    phase: str,
+    llm_provider: str,
+    llm_model: str,
+    cli_session_id: str,
+    cli_turn_kind: str,
+    prompt_turn_id: str | None,
+) -> None:
+    """Record a failed LLM run blocked by hosted or provider credit exhaustion."""
+    properties: Properties = {
+        "reason_code": reason_code,
+        "credit_source": "opensre" if reason_code == LLMCreditErrorReason.OPENSRE else "provider",
+        "phase": phase,
+        "llm_provider": llm_provider,
+        "llm_model": llm_model,
+        "cli_session_id": cli_session_id,
+        "cli_turn_kind": cli_turn_kind,
+    }
+    if prompt_turn_id:
+        properties["prompt_turn_id"] = prompt_turn_id
+    _capture(Event.LLM_CREDIT_LIMIT_REACHED, properties)
+
+
 def capture_react_turn_completed(
     *,
     phase: str,
@@ -283,7 +358,20 @@ def capture_react_turn_completed(
     llm_provider: str,
     llm_model: str,
     prompt_turn_id: str | None = None,
+    loop_stop_reason: str = "",
+    error_type: str = "",
+    error_message: str = "",
+    scheduled_task_id: str = "",
+    ai_error_reason: str = "",
 ) -> None:
+    """Record one finished ReAct run.
+
+    ``stop_reason`` is the collapsed dashboard value; ``loop_stop_reason`` is the
+    loop's own reason, which tells ``goal_unverified`` and ``stagnation_limit``
+    apart from a real ``iteration_cap``. A run that raised also carries its
+    exception type and a redacted, capped ``error_message``. A run inside a
+    scheduled tick names the task as ``scheduled_task_id``.
+    """
     properties: Properties = {
         "phase": phase,
         "llm_iterations_used": llm_iterations_used,
@@ -299,6 +387,16 @@ def capture_react_turn_completed(
     }
     if prompt_turn_id:
         properties["prompt_turn_id"] = prompt_turn_id
+    if loop_stop_reason:
+        properties["loop_stop_reason"] = loop_stop_reason
+    if error_type:
+        properties["error_type"] = error_type
+    if ai_error_reason:
+        properties["ai_error_reason"] = ai_error_reason
+    if recorded_error := bounded_error_message(error_message):
+        properties["error_message"] = recorded_error
+    if scheduled_task_id:
+        properties["scheduled_task_id"] = scheduled_task_id
     _capture(Event.REACT_TURN_COMPLETED, properties)
 
 
@@ -349,12 +447,23 @@ def capture_agent_tool_call_completed(
     duration_ms: int,
     work_status: str = "",
     error_message: str = "",
+    blocked_by: str = "",
+    skipped_by: str = "",
+    exception_type: str = "",
+    error_class: str = "",
+    unavailable: bool = False,
+    setup_command: str = "",
+    error_source: str = "",
+    iteration: int | None = None,
+    tool_call_index: int | None = None,
 ) -> None:
     """Record the privacy-safe outcome of one model-requested tool call.
 
     A failed call also carries ``error_message``: the tool's own description of
-    what went wrong, redacted and length-capped. Arguments and result evidence
-    stay off the event.
+    what went wrong, redacted and length-capped. It says why when known: the
+    hook that blocked it, why it was skipped, the exception type, the tool's own
+    error class, and for an unavailable integration its source and setup
+    command. Arguments and result evidence stay off the event.
     """
     properties: Properties = {
         "tool_call_id": tool_call_id,
@@ -368,10 +477,27 @@ def capture_agent_tool_call_completed(
         "duration_ms": duration_ms,
         "duration_bucket": _bucket_duration_ms(duration_ms),
         "work_status": work_status,
+        "unavailable": unavailable,
     }
-    recorded_error = _bounded_redacted_text(error_message, max_chars=_TOOL_ERROR_MESSAGE_MAX_CHARS)
-    if is_error and recorded_error:
+    if is_error and (recorded_error := bounded_error_message(error_message)):
         properties["error_message"] = recorded_error
+    facts = {
+        "blocked_by": (blocked_by, _TOOL_FACT_MAX_CHARS),
+        "skipped_by": (skipped_by, _TOOL_FACT_MAX_CHARS),
+        "exception_type": (exception_type, _TOOL_FACT_MAX_CHARS),
+        "error_class": (error_class, _TOOL_FACT_MAX_CHARS),
+        "error_source": (error_source, _TOOL_FACT_MAX_CHARS),
+        "setup_command": (setup_command, _TOOL_SETUP_COMMAND_MAX_CHARS),
+    }
+    for name, (value, max_chars) in facts.items():
+        if value and (recorded := _bounded_redacted_text(value, max_chars=max_chars)):
+            properties[name] = recorded
+    if prompt_turn_id := get_prompt_turn_id():
+        properties["prompt_turn_id"] = prompt_turn_id
+    if iteration is not None:
+        properties["iteration"] = iteration
+    if tool_call_index is not None:
+        properties["tool_call_index"] = tool_call_index
     _capture(Event.AGENT_TOOL_CALL_COMPLETED, properties)
 
 
@@ -418,24 +544,25 @@ def capture_ask_user_prompt_rendered(
     allow_custom: bool,
     has_command_options: bool,
     skill_name: str | None,
+    reason_code: str | None = None,
 ) -> None:
-    """Record a structured Ask User prompt when it becomes visible."""
+    """Record a structured Ask User prompt when it becomes visible.
+
+    ``reason_code`` names why the menu opened when its author declared one.
+    """
     sanitized = _ask_user_questions(questions)
-    _capture(
-        Event.ASK_USER_PROMPT_RENDERED,
-        _with_optional_skill(
-            {
-                "interaction_id": interaction_id,
-                "prompt_kind": "batch" if len(sanitized) > 1 else "single",
-                "question_count": len(sanitized),
-                "questions": cast(list[JsonValue], sanitized),
-                "render_mode": render_mode,
-                "allow_custom": allow_custom,
-                "has_command_options": has_command_options,
-            },
-            skill_name,
-        ),
-    )
+    properties: Properties = {
+        "interaction_id": interaction_id,
+        "prompt_kind": "batch" if len(sanitized) > 1 else "single",
+        "question_count": len(sanitized),
+        "questions": cast(list[JsonValue], sanitized),
+        "render_mode": render_mode,
+        "allow_custom": allow_custom,
+        "has_command_options": has_command_options,
+    }
+    if reason_code:
+        properties["reason_code"] = reason_code
+    _capture(Event.ASK_USER_PROMPT_RENDERED, _with_optional_skill(properties, skill_name))
 
 
 def capture_ask_user_prompt_answered(
@@ -476,16 +603,21 @@ def capture_ask_user_prompt_answered(
 
 
 def capture_ask_user_prompt_dismissed(
-    *, interaction_id: str, reason: str, skill_name: str | None
+    *,
+    interaction_id: str,
+    reason: str,
+    skill_name: str | None,
+    dismiss_key: str | None = None,
 ) -> None:
-    """Record a rendered Ask User prompt closed without an answer."""
-    _capture(
-        Event.ASK_USER_PROMPT_DISMISSED,
-        _with_optional_skill(
-            {"interaction_id": interaction_id, "reason": reason},
-            skill_name,
-        ),
-    )
+    """Record a rendered Ask User prompt closed without an answer.
+
+    ``dismiss_key`` names the key class that closed the picker (``esc``,
+    ``ctrl_c``, ``eof``, …) when the picker reported one.
+    """
+    properties: Properties = {"interaction_id": interaction_id, "reason": reason}
+    if dismiss_key is not None:
+        properties["dismiss_key"] = dismiss_key
+    _capture(Event.ASK_USER_PROMPT_DISMISSED, _with_optional_skill(properties, skill_name))
 
 
 def capture_interactive_shell_rendered(*, entrypoint: str) -> None:
@@ -555,8 +687,53 @@ def capture_skills_release_activated(
     _capture(Event.SKILLS_RELEASE_ACTIVATED, properties)
 
 
+def capture_scheduled_task_reported(
+    *,
+    task_id: str,
+    loop_id: str,
+    message_id: str,
+    delivered_at: str,
+    message: str,
+    prompt: str,
+    organization_id: str = "",
+) -> None:
+    """Record a loop report delivered to the OpenSRE inbox, with the prompt that produced it.
+
+    The event ID comes from the inbox delivery and the event keeps its delivery
+    time, so resending a report replaces the stored row instead of adding one.
+    A task's own organization overrides the process's.
+    """
+    properties: Properties = {
+        "task_id": task_id,
+        "loop_id": _bounded_redacted_text(loop_id, max_chars=_LOOP_ID_MAX_CHARS),
+        "message_id": message_id,
+        "delivered_at": delivered_at,
+        "message": _bounded_redacted_text(message, max_chars=_LOOP_REPORT_MAX_CHARS),
+    }
+    if prompt.strip():
+        properties["prompt"] = _bounded_redacted_text(prompt, max_chars=_LOOP_PROMPT_MAX_CHARS)
+    if organization_id.strip():
+        properties["organization_id"] = organization_id.strip()
+    event_id = uuid5(
+        NAMESPACE_URL, f"opensre:{Event.SCHEDULED_TASK_REPORTED}:{task_id}:{message_id}"
+    )
+    try:
+        get_analytics().capture(
+            Event.SCHEDULED_TASK_REPORTED,
+            properties,
+            event_id=str(event_id),
+            occurred_at=delivered_at,
+        )
+    except Exception as exc:
+        capture_exception(exc)
+
+
 def capture_skill_value_delivered(
-    *, skill_name: str, insight: str, prompt_turn_id: str | None = None
+    *,
+    skill_name: str,
+    insight: str,
+    prompt_turn_id: str | None = None,
+    insight_kind: str = "",
 ) -> None:
     """Record the business insight that successfully reached a skill's output sink."""
     properties: Properties = {
@@ -565,7 +742,95 @@ def capture_skill_value_delivered(
     }
     if prompt_turn_id:
         properties["prompt_turn_id"] = prompt_turn_id
+    if insight_kind:
+        properties["insight_kind"] = insight_kind[:_TOOL_FACT_MAX_CHARS]
     _capture(Event.SKILL_VALUE_DELIVERED, properties)
+
+
+def capture_workspace_scanned(
+    *,
+    repositories: int,
+    repos_with_workflows: int,
+    repos_on_github: int,
+    commits: int,
+    own_commits: int,
+    uncommitted: int,
+    days: int,
+    stop_reason: str | None,
+    truncated: bool,
+    skipped_protected: int,
+    prefetched: bool,
+    via: str,
+) -> None:
+    """Record what one local workspace scan found, as counts: no repository names or paths.
+
+    ``via`` names what asked for the scan: the scan tool, or the local insights analysis.
+    """
+    _capture(
+        Event.WORKSPACE_SCANNED,
+        {
+            "repositories": repositories,
+            "repos_with_workflows": repos_with_workflows,
+            "repos_on_github": repos_on_github,
+            "commits": commits,
+            "own_commits": own_commits,
+            "uncommitted": uncommitted,
+            "days": days,
+            "stop_reason": stop_reason or "",
+            "truncated": truncated,
+            "skipped_protected": skipped_protected,
+            "prefetched": prefetched,
+            "via": via,
+        },
+    )
+
+
+def capture_local_repositories_analyzed(
+    *,
+    reason: str,
+    github_error: str,
+    outcome: str,
+    repositories: int,
+    commits: int,
+    own_commits: int,
+    ai_coauthored_share: int | None,
+    insight_kinds: Sequence[str],
+    ci_providers: Mapping[str, int],
+    hosts: Mapping[str, int],
+    repos_without_ci: int,
+    days: int,
+    duration_ms: int,
+) -> None:
+    """Record one local repository analysis as counts and kinds: no names, paths or commit text.
+
+    ``ai_coauthored_share`` is the rounded percentage of the user's commits an AI
+    agent co-authored, None when there were too few to tell.
+    """
+    properties: Properties = {
+        "reason": reason[:_TOOL_FACT_MAX_CHARS],
+        "github_error": github_error[:_TOOL_FACT_MAX_CHARS],
+        "outcome": outcome,
+        "repositories": repositories,
+        "commits": commits,
+        "own_commits": own_commits,
+        "insight_kinds": list(insight_kinds),
+        "ci_providers": dict(ci_providers),
+        "hosts": dict(hosts),
+        "repos_without_ci": repos_without_ci,
+        "days": days,
+        "duration_ms": duration_ms,
+    }
+    if ai_coauthored_share is not None:
+        properties["ai_coauthored_share"] = ai_coauthored_share
+    _capture(Event.LOCAL_REPOSITORIES_ANALYZED, properties)
+
+
+def capture_skill_prerequisite_missing(*, skill: str, check: str, reason_code: str) -> None:
+    """Record a skill held at entry because one of its host-owned prerequisites is unmet."""
+    _capture(
+        Event.SKILL_PREREQUISITE_MISSING,
+        {"skill": skill, "check": check, "reason_code": reason_code},
+    )
 
 
 def capture_opensre_commit_created(
