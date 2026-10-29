@@ -628,6 +628,37 @@ def test_cron_add_persists_loop_name(tmp_path: Path, monkeypatch: pytest.MonkeyP
     assert list_tasks(store)[0].name == "Morning report"
 
 
+def test_cron_add_empty_timezone_defaults_to_utc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from infrastructure.scheduling.scheduler.storage import task_store as scheduler_store
+    from infrastructure.scheduling.scheduler.storage.task_store import list_tasks
+
+    store = tmp_path / "scheduler_tasks.json"
+    monkeypatch.setattr(scheduler_store, "default_task_store_path", lambda: store)
+
+    result = CliRunner().invoke(
+        cron_module.cron_command,
+        [
+            "add",
+            "--kind",
+            "manual_loop",
+            "--cron",
+            "0 9 * * *",
+            "--tz",
+            "",
+            "--provider",
+            "interactive_shell",
+            "--prompt",
+            "Check open incidents.",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "TZ: UTC" in result.output
+    assert list_tasks(store)[0].timezone == "UTC"
+
+
 def test_cron_add_persists_github_ci_health_scope(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
