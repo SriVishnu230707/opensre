@@ -24,4 +24,4 @@ def test_issue_events_uses_supported_page_size(monkeypatch) -> None:
 
     assert events == [{"eventID": "one"}]
     assert requests[0].url.path == "/api/0/organizations/acme/issues/123/events/"
-    assert requests[0].url.params == {"per_page": "10"}
+    assert dict(requests[0].url.params) == {"per_page": "10"}
