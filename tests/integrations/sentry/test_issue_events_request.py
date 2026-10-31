@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+from http import HTTPStatus
+from typing import Any
+
 import httpx
+import pytest
 
 from integrations.sentry import SentryConfig
 from integrations.sentry.client import list_sentry_issue_events
 
 
-def test_issue_events_uses_supported_page_size(monkeypatch) -> None:
+def test_issue_events_uses_supported_page_size(monkeypatch: pytest.MonkeyPatch) -> None:
     """The requested event count must reach Sentry as per_page."""
     requests: list[httpx.Request] = []
 
-    def fake_request(method, url, **kwargs):
+    def fake_request(method: str, url: str, **kwargs: Any) -> httpx.Response:
         request = httpx.Request(method, url, params=kwargs["params"])
         requests.append(request)
-        return httpx.Response(200, json=[{"eventID": "one"}], request=request)
+        return httpx.Response(HTTPStatus.OK, json=[{"eventID": "one"}], request=request)
 
     monkeypatch.setattr(httpx, "request", fake_request)
     config = SentryConfig(organization_slug="acme", auth_token="secret")
