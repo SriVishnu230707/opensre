@@ -124,10 +124,36 @@ def test_list_monitors_success(client, mock_httpx_client):
     mock_httpx_client.return_value = mock_instance
 
     result = client.list_monitors()
-    mock_instance.get.assert_called_once()
+    mock_instance.get.assert_called_once_with(
+        "/api/v1/monitor", params={"page": 0, "page_size": 50}
+    )
 
     assert result["success"] is True
     assert result["monitors"][0]["name"] == "CPU Monitor"
+
+
+def test_list_monitors_uses_search_endpoint_for_query(client, mock_httpx_client):
+    mock_instance = MagicMock()
+    mock_instance.get.return_value = MagicMock(
+        json=lambda: {
+            "metadata": {"total_count": 1},
+            "monitors": [
+                {"id": 42, "name": "CPU Monitor", "status": "alert", "tags": ["team:sre"]}
+            ],
+        },
+        raise_for_status=MagicMock(),
+    )
+    mock_httpx_client.return_value = mock_instance
+
+    result = client.list_monitors(query="tag:team:sre")
+
+    mock_instance.get.assert_called_once_with(
+        "/api/v1/monitor/search",
+        params={"page": 0, "per_page": 50, "query": "tag:team:sre"},
+    )
+    assert result["success"] is True
+    assert result["total"] == 1
+    assert result["monitors"][0]["overall_state"] == "alert"
 
 
 def test_list_monitors_empty(client, mock_httpx_client):

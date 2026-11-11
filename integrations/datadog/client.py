@@ -194,14 +194,20 @@ class DatadogClient:
         query: str | None = None,
     ) -> dict[str, Any]:
         """List Datadog monitors, optionally filtered by query."""
-        params: dict[str, Any] = {"page": 0, "page_size": 50}
+        params: dict[str, Any] = {"page": 0}
         if query:
+            endpoint = "/api/v1/monitor/search"
+            params["per_page"] = 50
             params["query"] = query
+        else:
+            endpoint = "/api/v1/monitor"
+            params["page_size"] = 50
 
         try:
-            resp = self._get_client().get("/api/v1/monitor", params=params)
+            resp = self._get_client().get(endpoint, params=params)
             resp.raise_for_status()
-            monitors = resp.json()
+            payload = resp.json()
+            monitors = payload.get("monitors", []) if query else payload
 
             results = []
             for m in monitors if isinstance(monitors, list) else []:
@@ -212,7 +218,7 @@ class DatadogClient:
                         "type": m.get("type", ""),
                         "query": m.get("query", ""),
                         "message": m.get("message", ""),
-                        "overall_state": m.get("overall_state", ""),
+                        "overall_state": m.get("overall_state", m.get("status", "")),
                         "tags": m.get("tags", []),
                     }
                 )
